@@ -29,6 +29,8 @@ type Relay struct {
 	publisher Publisher
 	// batch 单次领取上限。
 	batch int
+	// claimLease 事件领取租约时长；仅正值生效，零值表示不启用租约领取。
+	claimLease time.Duration
 	// retryBackoff 一批事件全部发送失败后的再次领取间隔。
 	retryBackoff time.Duration
 	// idleWait 没有待投递事件时的轮询等待。
@@ -63,6 +65,20 @@ func WithIdleWait(d time.Duration) RelayOption {
 	return func(r *Relay) {
 		if d > 0 {
 			r.idleWait = d
+		}
+	}
+}
+
+// WithClaimLease 启用带租约的事件领取：领取成功后事件在 d 内不会被重复
+// 领取，同一有效租约内最多交给 Publish 一次；worker 失联导致租约到期后，
+// 事件在下一次 DeliverOnce/Run 自动恢复并可重新投递，维持至少一次语义。
+// 仅接受正时长；非正时长不启用租约，保持默认领取行为。
+// 启用后要求 Store 实现 ClaimLeaseStore，否则 DeliverOnce/Run 返回
+// 可 errors.Is 判定的 ErrClaimLeaseUnsupported。
+func WithClaimLease(d time.Duration) RelayOption {
+	return func(r *Relay) {
+		if d > 0 {
+			r.claimLease = d
 		}
 	}
 }
@@ -106,7 +122,11 @@ type RelayResult struct {
 
 // DeliverOnce 执行一轮领取与投递，不阻塞等待。没有事件时立即返回空结果。
 // 单个事件发送失败不影响同批其它事件；失败事件被 Nack，可在后续轮次继续领取。
+// 启用租约（WithClaimLease）后走带租约领取路径。
 func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
+	if r.claimLease > 0 {
+		return r.deliverOnceLeased(ctx)
+	}
 	events, err := r.store.ClaimPendingEvents(ctx, r.batch)
 	if err != nil {
 		return RelayResult{}, err
@@ -132,6 +152,49 @@ func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
 		res.Delivered++
 	}
 	return res, nil
+}
+
+// deliverOnceLeased 是启用租约后的 DeliverOnce 路径：以带租约方式领取事件，
+// 按当前 ClaimID 确认或退回。Store 未实现 ClaimLeaseStore 时返回
+// ErrClaimLeaseUnsupported。
+func (r *Relay) deliverOnceLeased(ctx context.Context) (RelayResult, error) {
+	ls, ok := r.store.(ClaimLeaseStore)
+	if !ok {
+		return RelayResult{}, ErrClaimLeaseUnsupported
+	}
+	claims, err := ls.ClaimPendingEventsLeased(ctx, r.batch, r.claimLease)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	res := RelayResult{Claimed: len(claims)}
+	for _, cl := range claims {
+		if err := ctx.Err(); err != nil {
+			// 领取后、Publish 前取消：按当前 ClaimID 立即退回，
+			// 事件不必等租约到期即可被重新领取。
+			nackLeased(ctx, ls, cl)
+			res.Failed++
+			continue
+		}
+		if err := r.publisher.Publish(ctx, cl.Event); err != nil {
+			// 含 Publish 过程中取消：按返回结果处理，失败即退回。
+			nackLeased(ctx, ls, cl)
+			res.Failed++
+			continue
+		}
+		if err := ls.AckLeasedEvent(ctx, cl.Event.ID, cl.ClaimID); err != nil {
+			return res, err
+		}
+		res.Delivered++
+	}
+	return res, nil
+}
+
+// nackLeased 按当前 ClaimID 退回已领取事件。调用方上下文已取消时换用
+// 独立上下文重试一次，保证退回生效、事件不被滞留到租约到期。
+func nackLeased(ctx context.Context, ls ClaimLeaseStore, cl ClaimedEvent) {
+	if err := ls.NackLeasedEvent(ctx, cl.Event.ID, cl.ClaimID); err != nil {
+		_ = ls.NackLeasedEvent(context.Background(), cl.Event.ID, cl.ClaimID)
+	}
 }
 
 // Run 循环执行投递，直到 ctx 被取消。至少一轮成功投递后返回 ctx.Err()。

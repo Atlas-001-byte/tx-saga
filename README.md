@@ -24,6 +24,10 @@
 - **Outbox**：状态存储原子保存执行状态与待投递事件；调用方可领取事件、
   交给 `Publisher` 发送，成功后标记已投递，失败后保留原事件、累计投递次数
   并可继续领取。
+- **领取租约**：实现 `ClaimLeaseStore` 的存储（含 `MemoryStore`）支持带租约
+  领取。`Relay` 以 `WithClaimLease` 启用后，事件在租约内不会被重复领取，
+  同一有效租约内最多投递一次；worker 失联导致租约到期后，事件在下一次
+  `DeliverOnce`/`Run` 自动恢复重投，维持至少一次投递。
 
 本包不规定磁盘文件格式：持久化由 `Store` 接口承载，仓库提供进程内
 `MemoryStore`，调用方可另行实现基于数据库事务的存储。
@@ -36,9 +40,10 @@
 | `ExecutionRequest` | 执行请求：业务键、外部幂等键、透传负载 |
 | `Result` / `StepOutcome` | 确定状态、失败原因、业务键、各步处理结果与调用次数 |
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
-| `MemoryStore` | 内存状态存储实现 |
+| `ClaimLeaseStore` | 可选的带租约领取接口：租约领取、按 ClaimID 确认/退回，到期自动恢复 |
+| `MemoryStore` | 内存状态存储实现（同时实现 `ClaimLeaseStore`） |
 | `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果 |
-| `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
+| `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写；`WithClaimLease` 启用租约领取 |
 
 执行状态：`running`、`compensating` 为中间状态；`completed`、`failed`、
 `compensation_failed` 为固定终态，终态结果在后续同身份调用中直接返回。
@@ -47,7 +52,9 @@
 
 - `ErrInvalidDefinition`：非法定义，或缺失业务键/外部幂等键；
 - `ErrExecutionNotFound`：查询未知执行身份；
-- `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义。
+- `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义；
+- `ErrClaimLeaseUnsupported`：`Relay` 已启用租约领取，但 Store 未实现 `ClaimLeaseStore`；
+- `ErrStaleClaim`：用于 Ack/Nack 的 ClaimID 已不是该事件的当前租约，操作被拒绝。
 
 ## 最小用法
 
@@ -77,6 +84,13 @@ relay := txsaga.NewRelay(store, txsaga.PublisherFunc(func(ctx context.Context, e
     return nil
 }))
 if _, err := relay.DeliverOnce(ctx); err != nil { /* ... */ }
+```
+
+启用租约恢复（要求 Store 实现 `ClaimLeaseStore`，如 `MemoryStore`）：
+
+```go
+relay := txsaga.NewRelay(store, publisher, txsaga.WithClaimLease(30*time.Second))
+// 领取后 worker 失联的事件在租约到期后自动恢复，由后续 DeliverOnce/Run 重投。
 ```
 
 ## 示例

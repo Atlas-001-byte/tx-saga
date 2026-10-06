@@ -115,6 +115,41 @@ type Store interface {
 	NackEvent(ctx context.Context, eventID string) error
 }
 
+// ClaimedEvent 是一次带租约领取的结果。
+type ClaimedEvent struct {
+	// Event 被领取的事件快照；字段与追加时一致。
+	Event Event
+	// ClaimID 本次领取的唯一标识，每次领取都重新生成；
+	// 仅持有当前 ClaimID 的调用方可 Ack/Nack 该事件。
+	ClaimID string
+	// ClaimedUntil 租约到期时间，自领取成功起算；
+	// 到期前事件不会被再次领取。
+	ClaimedUntil time.Time
+}
+
+// ClaimLeaseStore 是可选的带租约事件领取能力，在 Store 之外独立扩展。
+// Relay 通过 WithClaimLease 启用租约后要求 Store 实现本接口，
+// 否则 DeliverOnce/Run 返回 ErrClaimLeaseUnsupported。
+type ClaimLeaseStore interface {
+	// ClaimPendingEventsLeased 领取至多 max 条待投递事件，并为每条事件建立
+	// 自领取成功起算、有效期为 lease 的租约。每次领取生成新的 ClaimID，
+	// 事件的 Deliveries 计数加一并更新 LastAttemptAt。有效期内的租约事件
+	// 不会被再次领取；租约到期仍未 Ack/Nack 的事件自动恢复为可领取，
+	// 由下一次领取（或 Relay 的 DeliverOnce/Run）重新取得，维持至少一次投递。
+	// max<=0 表示实现自选批量。
+	ClaimPendingEventsLeased(ctx context.Context, max int, lease time.Duration) ([]ClaimedEvent, error)
+
+	// AckLeasedEvent 以当前 ClaimID 确认事件已投递成功，事件永久移除。
+	// ClaimID 不是该事件当前租约时返回可 errors.Is 判定的 ErrStaleClaim，
+	// 且不改动事件与新租约。
+	AckLeasedEvent(ctx context.Context, eventID, claimID string) error
+
+	// NackLeasedEvent 以当前 ClaimID 退回事件：保留原事件与负载、解除租约，
+	// 事件立即可再次领取。ClaimID 不是该事件当前租约时返回可 errors.Is
+	// 判定的 ErrStaleClaim，且不改动事件与新租约。
+	NackLeasedEvent(ctx context.Context, eventID, claimID string) error
+}
+
 // fingerprint 计算定义指纹：名称、版本与有序步骤名共同决定。
 // 动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
 func fingerprint(d Definition) string {
@@ -134,6 +169,9 @@ func fingerprint(d Definition) string {
 type memEvent struct {
 	event   Event
 	claimed bool
+	// 租约领取状态；非租约领取时 claimID 为空、claimedUntil 为零值。
+	claimID      string
+	claimedUntil time.Time
 }
 
 type memTx struct {
@@ -178,7 +216,9 @@ type MemoryStore struct {
 	bindings map[string]Binding
 	events   map[string]*memEvent
 	pending  []string // 未领取事件 ID，保持追加顺序
+	leased   []string // 租约领取中的事件 ID，按领取顺序，用于到期恢复
 	seq      uint64
+	claimSeq uint64
 	now      func() time.Time
 }
 
@@ -267,6 +307,31 @@ func (s *MemoryStore) Commit(_ context.Context, businessKey, idempotencyKey stri
 	return nil
 }
 
+// recoverExpiredLeasesLocked 把租约已到期且未 Ack/Nack 的事件退回待领取队列，
+// 使失联 worker 持有的事件自动恢复为可领取。每次领取前执行；
+// 已确认、已退回或非租约领取的条目一并移出租约跟踪。
+func (s *MemoryStore) recoverExpiredLeasesLocked(now time.Time) {
+	if len(s.leased) == 0 {
+		return
+	}
+	kept := s.leased[:0]
+	for _, id := range s.leased {
+		me, ok := s.events[id]
+		if !ok || !me.claimed || me.claimedUntil.IsZero() {
+			continue
+		}
+		if now.Before(me.claimedUntil) {
+			kept = append(kept, id)
+			continue
+		}
+		me.claimed = false
+		me.claimID = ""
+		me.claimedUntil = time.Time{}
+		s.pending = append(s.pending, id)
+	}
+	s.leased = kept
+}
+
 // ClaimPendingEvents 实现 Store 接口。
 func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, error) {
 	s.mu.Lock()
@@ -276,6 +341,7 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 		max = 16
 	}
 	now := s.now()
+	s.recoverExpiredLeasesLocked(now)
 	out := make([]*Event, 0, max)
 	remaining := s.pending[:0]
 	for _, id := range s.pending {
@@ -317,6 +383,72 @@ func (s *MemoryStore) NackEvent(_ context.Context, eventID string) error {
 		return nil // 幂等退回：未在领取中的事件无需处理
 	}
 	me.claimed = false
+	s.pending = append(s.pending, eventID)
+	return nil
+}
+
+// ClaimPendingEventsLeased 实现 ClaimLeaseStore 接口。
+func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, max int, lease time.Duration) ([]ClaimedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if max <= 0 {
+		max = 16
+	}
+	now := s.now()
+	s.recoverExpiredLeasesLocked(now)
+	until := now.Add(lease)
+	out := make([]ClaimedEvent, 0, max)
+	remaining := s.pending[:0]
+	for _, id := range s.pending {
+		me := s.events[id]
+		if len(out) >= max {
+			remaining = append(remaining, id)
+			continue
+		}
+		s.claimSeq++
+		me.claimed = true
+		me.claimID = fmt.Sprintf("claim-%020d", s.claimSeq)
+		me.claimedUntil = until
+		me.event.deliveries++
+		me.event.lastAttemptAt = now
+		cp := me.event
+		out = append(out, ClaimedEvent{Event: cp, ClaimID: me.claimID, ClaimedUntil: until})
+		s.leased = append(s.leased, id)
+	}
+	s.pending = remaining
+	return out, nil
+}
+
+// AckLeasedEvent 实现 ClaimLeaseStore 接口。
+func (s *MemoryStore) AckLeasedEvent(_ context.Context, eventID, claimID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	me, ok := s.events[eventID]
+	if !ok {
+		return fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	if !me.claimed || me.claimID != claimID {
+		return fmt.Errorf("txsaga: event %q: %w", eventID, ErrStaleClaim)
+	}
+	delete(s.events, eventID)
+	return nil
+}
+
+// NackLeasedEvent 实现 ClaimLeaseStore 接口。
+func (s *MemoryStore) NackLeasedEvent(_ context.Context, eventID, claimID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	me, ok := s.events[eventID]
+	if !ok {
+		return fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	if !me.claimed || me.claimID != claimID {
+		return fmt.Errorf("txsaga: event %q: %w", eventID, ErrStaleClaim)
+	}
+	me.claimed = false
+	me.claimID = ""
+	me.claimedUntil = time.Time{}
 	s.pending = append(s.pending, eventID)
 	return nil
 }

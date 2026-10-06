@@ -73,6 +73,12 @@ var (
 	// ErrDefinitionConflict 相同业务键已绑定不同的 Saga 定义。
 	// 同一业务键上的所有执行必须共用同一份定义。
 	ErrDefinitionConflict = errors.New("txsaga: saga definition conflict for business key")
+	// ErrClaimLeaseUnsupported 表示 Relay 已通过 WithClaimLease 启用租约领取，
+	// 但当前 Store 未实现 ClaimLeaseStore。
+	ErrClaimLeaseUnsupported = errors.New("txsaga: store does not support claim leases")
+	// ErrStaleClaim 表示用于 Ack/Nack 的 ClaimID 已不是该事件的当前租约；
+	// 操作被拒绝，事件与当前租约均不受影响。
+	ErrStaleClaim = errors.New("txsaga: stale claim")
 )
 
 // ActionFunc 是一个步骤的正向幂等动作。
