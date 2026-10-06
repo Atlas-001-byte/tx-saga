@@ -236,12 +236,21 @@ type MemoryStore struct {
 	seq      uint64
 	claimSeq uint64 // 租约 ClaimID 序列
 	now      func() time.Time
+
+	// history 按执行身份保存全部事件 ID 的追加顺序，事件 Ack 后 ID 仍保留，
+	// 因此跨页顺序不受领取、退回、租约到期或确认影响。
+	history map[string][]string
+	// audited 保存已 Ack 事件的只读审计副本（投递元数据冻结在确认时刻）。
+	// 活跃 Outbox 事件仍在 events 中，Ack 时从 events 移除并复制到此处，
+	// 领取/计数等既有行为保持不变。
+	audited map[string]EventRecord
 }
 
-// 编译期断言：MemoryStore 同时满足 Store 与 ClaimLeaseStore。
+// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore 与 EventHistoryStore。
 var (
-	_ Store           = (*MemoryStore)(nil)
-	_ ClaimLeaseStore = (*MemoryStore)(nil)
+	_ Store             = (*MemoryStore)(nil)
+	_ ClaimLeaseStore   = (*MemoryStore)(nil)
+	_ EventHistoryStore = (*MemoryStore)(nil)
 )
 
 // NewMemoryStore 创建内存状态存储。
@@ -250,6 +259,8 @@ func NewMemoryStore() *MemoryStore {
 		execs:    make(map[string]*ExecutionState),
 		bindings: make(map[string]Binding),
 		events:   make(map[string]*memEvent),
+		history:  make(map[string][]string),
+		audited:  make(map[string]EventRecord),
 		now:      time.Now,
 	}
 }
@@ -318,6 +329,7 @@ func (s *MemoryStore) Commit(_ context.Context, businessKey, idempotencyKey stri
 		s.execs[execID(businessKey, idempotencyKey)] = cloneState(t.state)
 	}
 
+	eid := execID(businessKey, idempotencyKey)
 	for i := range t.staged {
 		ev := t.staged[i]
 		s.seq++
@@ -325,6 +337,9 @@ func (s *MemoryStore) Commit(_ context.Context, businessKey, idempotencyKey stri
 		ev.OccurredAt = now
 		s.events[ev.ID] = &memEvent{event: ev}
 		s.pending = append(s.pending, ev.ID)
+		// 与状态在同一临界区内提交：当次追加的若干事件对历史查询同时可见。
+		// ID 在 Ack 后仍保留，作为审计链的顺序锚点。
+		s.history[eid] = append(s.history[eid], ev.ID)
 	}
 	return nil
 }
@@ -416,9 +431,11 @@ func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Durat
 func (s *MemoryStore) AckEvent(_ context.Context, eventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.events[eventID]; !ok {
+	me, ok := s.events[eventID]
+	if !ok {
 		return fmt.Errorf("txsaga: event %q not found", eventID)
 	}
+	s.audited[eventID] = toEventRecord(me.event)
 	delete(s.events, eventID)
 	return nil
 }
@@ -436,6 +453,7 @@ func (s *MemoryStore) AckLeasedEvent(_ context.Context, eventID, claimID string)
 		// 均不得改动当前事件或新租约。
 		return fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, ErrStaleClaim)
 	}
+	s.audited[eventID] = toEventRecord(me.event)
 	delete(s.events, eventID)
 	return nil
 }
@@ -500,4 +518,78 @@ func (s *MemoryStore) TotalEvents() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.events)
+}
+
+// toEventRecord 把一条活跃事件复制为只读审计记录。
+func toEventRecord(ev Event) EventRecord {
+	return EventRecord{
+		ID:            ev.ID,
+		Type:          ev.Type,
+		OccurredAt:    ev.OccurredAt,
+		Payload:       ev.Payload,
+		BusinessKey:   ev.BusinessKey,
+		Deliveries:    ev.deliveries,
+		LastAttemptAt: ev.lastAttemptAt,
+	}
+}
+
+// ListEvents 实现 EventHistoryStore 接口：整库加锁读取一页一致快照，
+// 不修改执行状态、事件顺序或任何投递元数据。
+func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventHistoryPage, error) {
+	if q.Limit <= 0 {
+		q.Limit = defaultEventHistoryLimit
+	}
+	eid := execID(q.BusinessKey, q.IdempotencyKey)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.execs[eid]
+	if st == nil || st.SagaName != q.SagaName {
+		return EventHistoryPage{}, ErrExecutionNotFound
+	}
+	ids := s.history[eid]
+
+	start := 0
+	if q.AfterID != "" {
+		pos := -1
+		for i, id := range ids {
+			if id == q.AfterID {
+				pos = i
+				break
+			}
+		}
+		if pos < 0 {
+			// 游标不存在或属于其它执行；不返回部分页，也不触碰任何状态。
+			return EventHistoryPage{}, ErrEventCursorNotFound
+		}
+		start = pos + 1
+	}
+
+	page := EventHistoryPage{Records: []EventRecord{}}
+	if start >= len(ids) {
+		return page, nil
+	}
+	end := start + q.Limit
+	if end > len(ids) {
+		end = len(ids)
+	}
+	for _, id := range ids[start:end] {
+		// 活跃事件读取当前投递元数据；已 Ack 事件使用确认时冻结的副本。
+		if me, ok := s.events[id]; ok {
+			page.Records = append(page.Records, toEventRecord(me.event))
+			continue
+		}
+		if rec, ok := s.audited[id]; ok {
+			page.Records = append(page.Records, rec)
+			continue
+		}
+		// history 只可能引用活跃事件或已留存的 Ack 副本，缺失属于内部不变量被破坏。
+		return EventHistoryPage{}, fmt.Errorf("txsaga: event %q missing from history storage", id)
+	}
+	if end < len(ids) {
+		page.HasMore = true
+		page.NextAfterID = page.Records[len(page.Records)-1].ID
+	}
+	return page, nil
 }

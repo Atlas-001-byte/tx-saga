@@ -24,6 +24,9 @@
 - **Outbox**：状态存储原子保存执行状态与待投递事件；调用方可领取事件、
   交给 `Publisher` 发送，成功后标记已投递，失败后保留原事件、累计投递次数
   并可继续领取。
+- **执行事件历史**：按执行身份只读回看完整事件链，事件按追加顺序分页返回；
+  待投递、领取中、发送失败被退回与已 Ack 的事件均可查询，已 Ack 事件保留
+  相同 ID 的可审计副本，事件顺序不随 Ack/Nack、租约到期或投递次数变化。
 
 本包不规定磁盘文件格式：持久化由 `Store` 接口承载，仓库提供进程内
 `MemoryStore`，调用方可另行实现基于数据库事务的存储。
@@ -38,8 +41,10 @@
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
 | `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
 | `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
-| `MemoryStore` | 内存状态存储实现，同时实现 `Store` 与 `ClaimLeaseStore` |
-| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果 |
+| `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore` |
+| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 只读查询事件历史 |
+| `EventHistoryStore` | 可选的只读历史接口：按执行身份分页返回追加顺序的事件，已 Ack 事件保留审计副本 |
+| `EventRecord` / `EventHistoryPage` / `EventHistoryQuery` | 事件历史的记录、分页结果与查询输入（Saga 名、业务键、幂等键、`AfterID`、`Limit`） |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
 
 执行状态：`running`、`compensating` 为中间状态；`completed`、`failed`、
@@ -51,7 +56,9 @@
 - `ErrExecutionNotFound`：查询未知执行身份；
 - `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义；
 - `ErrClaimLeaseUnsupported`：`WithClaimLease` 启用了租约，但 Store 未实现 `ClaimLeaseStore`；
-- `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动。
+- `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动；
+- `ErrEventHistoryUnsupported`：`ListEvents` 要求 Store 实现 `EventHistoryStore`，当前 Store 未实现；
+- `ErrEventCursorNotFound`：历史查询的 `AfterID` 不属于目标执行，错误时不返回部分页。
 
 ## 最小用法
 
@@ -91,6 +98,33 @@ Ack 或 Nack 前退出时，事件于租约到期后的下一次 `DeliverOnce`/`
 `ClaimID` 立即 Nack；`Publish` 进行中取消则按其返回结果处理。Store 需
 实现 `ClaimLeaseStore`（`MemoryStore` 已实现），否则返回
 `ErrClaimLeaseUnsupported`。
+
+## 事件历史查询
+
+`Engine.ListEvents` 按执行身份只读回看完整事件链，适用于执行后的审计与
+排障。查询不推进执行、不调用动作、不追加事件，也不改变领取/投递状态：
+
+```go
+page, err := engine.ListEvents(ctx, txsaga.EventHistoryQuery{
+    SagaName:       "order-saga",
+    BusinessKey:    "ORDER-1001",
+    IdempotencyKey: "request-7a3f",
+    AfterID:        "",   // 空表示从头查询；续页传上一页 NextAfterID
+    Limit:          100,  // 非正数按 100 条返回
+})
+```
+
+返回的 `EventHistoryPage.Records` 按事件发生及追加顺序排列，每条
+`EventRecord` 含事件 ID、类型、发生时间、结构化负载、业务键，以及当前
+`Deliveries` 与 `LastAttemptAt`。待投递、领取中、发送失败被退回与已 Ack
+的事件都会出现；已 Ack 事件保留相同 ID 的副本，其投递元数据冻结在确认
+时刻。命中 `AfterID` 后从其下一条开始；有后续时 `HasMore` 为真且
+`NextAfterID` 指向下一页游标。事件顺序不随 Ack、Nack、租约到期或投递
+次数增加而变化。
+
+持久化 Store 通过实现 `EventHistoryStore`（在 `Store` 之上增加
+`ListEvents`）提供一致结果；未实现时 `ListEvents` 返回
+`ErrEventHistoryUnsupported`，既有自定义 Store 无需任何改动即可继续使用。
 
 ## 示例
 
