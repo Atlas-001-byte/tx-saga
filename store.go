@@ -182,6 +182,10 @@ func fingerprint(d Definition) string {
 type memEvent struct {
 	event Event
 
+	// idempotencyKey 是事件所属执行的外部幂等键，与 event.BusinessKey 共同
+	// 确定执行身份。历史查询按它过滤，不能从事件负载推断（负载对追加方透明）。
+	idempotencyKey string
+
 	// 普通领取（ClaimPendingEvents）的锁定标记。
 	claimed bool
 
@@ -233,15 +237,21 @@ type MemoryStore struct {
 	bindings map[string]Binding
 	events   map[string]*memEvent
 	pending  []string // 未领取事件 ID，保持追加顺序
+	// history 是只增的审计链：按追加顺序保存每条事件的指针，与 events 中
+	// 的活动对象共享同一 memEvent，因此领取/退回/重投更新投递元数据后，
+	// 历史读到的是最新计数；Ack 只从 events/pending 移除活动副本，审计副本
+	// 在此永久保留。顺序仅由追加位置决定，不受领取、退回、租约影响。
+	history  []*memEvent
 	seq      uint64
 	claimSeq uint64 // 租约 ClaimID 序列
 	now      func() time.Time
 }
 
-// 编译期断言：MemoryStore 同时满足 Store 与 ClaimLeaseStore。
+// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore 与 EventHistoryStore。
 var (
-	_ Store           = (*MemoryStore)(nil)
-	_ ClaimLeaseStore = (*MemoryStore)(nil)
+	_ Store             = (*MemoryStore)(nil)
+	_ ClaimLeaseStore   = (*MemoryStore)(nil)
+	_ EventHistoryStore = (*MemoryStore)(nil)
 )
 
 // NewMemoryStore 创建内存状态存储。
@@ -323,8 +333,12 @@ func (s *MemoryStore) Commit(_ context.Context, businessKey, idempotencyKey stri
 		s.seq++
 		ev.ID = fmt.Sprintf("evt-%020d", s.seq)
 		ev.OccurredAt = now
-		s.events[ev.ID] = &memEvent{event: ev}
+		me := &memEvent{event: ev, idempotencyKey: idempotencyKey}
+		s.events[ev.ID] = me
 		s.pending = append(s.pending, ev.ID)
+		// 与状态、活动事件在同一临界区内追加，保证历史读取只见原子提交的事件；
+		// 与 s.events 共享同一指针，投递元数据始终为最新值，Ack 后仍可审计。
+		s.history = append(s.history, me)
 	}
 	return nil
 }
@@ -500,4 +514,94 @@ func (s *MemoryStore) TotalEvents() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.events)
+}
+
+// ListEvents 实现 EventHistoryStore 接口：在同一把锁内扫描只增审计链，
+// 因此每页只可能读到整次 Commit 已提交的事件，且与并发执行、补偿、投递
+// 互不干扰。查询本身不修改任何字段。
+func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventHistoryPage, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = defaultEventHistoryLimit
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 先校验执行身份与 Saga 名称：不存在（含仅有事件、没有执行记录的情形）
+	// 或名称不符一律 ErrExecutionNotFound。
+	st, ok := s.execs[execID(q.BusinessKey, q.IdempotencyKey)]
+	if !ok || st.SagaName != q.SagaName {
+		return EventHistoryPage{}, ErrExecutionNotFound
+	}
+
+	start := 0
+	if q.AfterID != "" {
+		idx := -1
+		for i, me := range s.history {
+			if me.event.ID == q.AfterID &&
+				me.event.BusinessKey == q.BusinessKey &&
+				me.idempotencyKey == q.IdempotencyKey {
+				idx = i
+				break
+			}
+		}
+		// 游标不存在或属于其它执行：不返回部分结果，也不触碰任何状态。
+		if idx < 0 {
+			return EventHistoryPage{}, ErrEventCursorNotFound
+		}
+		start = idx + 1
+	}
+
+	page := EventHistoryPage{Events: []EventRecord{}}
+	if len(page.Events) == 0 && q.AfterID != "" {
+		// 空页（游标已是最后一条）时回传入参游标，重复查询保持幂等，
+		// 不会因空游标而误回到链首。
+		page.NextAfterID = q.AfterID
+	}
+	next := start // 本页之后第一个待检查的审计链位置
+	for i := start; i < len(s.history) && len(page.Events) < limit; i++ {
+		me := s.history[i]
+		if me.event.BusinessKey != q.BusinessKey || me.idempotencyKey != q.IdempotencyKey {
+			continue
+		}
+		page.Events = append(page.Events, toEventRecord(me))
+		next = i + 1
+	}
+	if len(page.Events) > 0 {
+		page.NextAfterID = page.Events[len(page.Events)-1].ID
+	}
+	for i := next; i < len(s.history); i++ {
+		me := s.history[i]
+		if me.event.BusinessKey == q.BusinessKey && me.idempotencyKey == q.IdempotencyKey {
+			page.HasMore = true
+			break
+		}
+	}
+	return page, nil
+}
+
+// toEventRecord 把内部事件复制为脱离存储的只读记录；与活动 Outbox 事件
+// 共享同一追加时刻的身份字段，投递元数据取读取当下的最新值。
+func toEventRecord(me *memEvent) EventRecord {
+	return EventRecord{
+		ID:            me.event.ID,
+		Type:          me.event.Type,
+		OccurredAt:    me.event.OccurredAt,
+		Payload:       cloneEventPayload(me.event.Payload),
+		BusinessKey:   me.event.BusinessKey,
+		Deliveries:    me.event.deliveries,
+		LastAttemptAt: me.event.lastAttemptAt,
+	}
+}
+
+// cloneEventPayload 复制负载中可变的切片，避免调用方修改记录影响存储内部。
+func cloneEventPayload(p any) any {
+	if ep, ok := p.(EventPayload); ok {
+		if ep.SucceededSteps != nil {
+			ep.SucceededSteps = append([]string(nil), ep.SucceededSteps...)
+		}
+		return ep
+	}
+	return p
 }

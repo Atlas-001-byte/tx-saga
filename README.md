@@ -24,6 +24,9 @@
 - **Outbox**：状态存储原子保存执行状态与待投递事件；调用方可领取事件、
   交给 `Publisher` 发送，成功后标记已投递，失败后保留原事件、累计投递次数
   并可继续领取。
+- **执行事件历史**：按执行身份（Saga 名称、业务键、外部幂等键）只读回看
+  完整事件链，按追加顺序分页；待投递、领取中、发送失败退回以及**已 Ack**
+  的事件都可审计，投递次数与最近领取时间随记录一并暴露。
 
 本包不规定磁盘文件格式：持久化由 `Store` 接口承载，仓库提供进程内
 `MemoryStore`，调用方可另行实现基于数据库事务的存储。
@@ -36,10 +39,12 @@
 | `ExecutionRequest` | 执行请求：业务键、外部幂等键、透传负载 |
 | `Result` / `StepOutcome` | 确定状态、失败原因、业务键、各步处理结果与调用次数 |
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
+| `EventHistoryStore` | 可选的只读历史接口：`ListEvents` 按执行身份分页回看事件链 |
 | `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
 | `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
-| `MemoryStore` | 内存状态存储实现，同时实现 `Store` 与 `ClaimLeaseStore` |
-| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果 |
+| `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore` |
+| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 查询事件历史 |
+| `EventHistoryQuery` / `EventRecord` / `EventHistoryPage` | 历史查询输入（Saga 名称、业务键、幂等键、`AfterID`、`Limit`）、单条事件记录与分页结果 |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
 
 执行状态：`running`、`compensating` 为中间状态；`completed`、`failed`、
@@ -51,7 +56,27 @@
 - `ErrExecutionNotFound`：查询未知执行身份；
 - `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义；
 - `ErrClaimLeaseUnsupported`：`WithClaimLease` 启用了租约，但 Store 未实现 `ClaimLeaseStore`；
-- `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动。
+- `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动；
+- `ErrEventHistoryUnsupported`：Store 未实现 `EventHistoryStore`，不支持事件历史查询；
+- `ErrEventCursorNotFound`：历史查询的 `AfterID` 不存在，或不属于给定执行身份；出错时不返回部分页。
+
+事件历史按执行身份只读查询，`AfterID` 为空从头开始，`Limit<=0` 按 100 条
+返回，页内按事件发生及追加顺序排列，以 `NextAfterID`/`HasMore` 续页。
+查询不推进执行、不调用动作、不追加事件，也不改变领取、退回、租约或投递
+计数；Ack、Nack、租约到期与投递次数增加都不改变事件顺序，已 Ack 事件
+保留可审计副本（投递次数与最近领取时间为其最后一次值）。
+
+```go
+page, err := engine.ListEvents(ctx, txsaga.EventHistoryQuery{
+    SagaName:       "order-saga",
+    BusinessKey:    "ORDER-1001",
+    IdempotencyKey: "request-7a3f",
+    AfterID:        "", // 上一页的 NextAfterID；首页留空
+    Limit:          50, // 非正数按 100
+})
+// page.Events []txsaga.EventRecord：ID、Type、OccurredAt、Payload、
+// BusinessKey、Deliveries、LastAttemptAt
+```
 
 ## 最小用法
 
