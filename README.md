@@ -36,7 +36,9 @@
 | `ExecutionRequest` | 执行请求：业务键、外部幂等键、透传负载 |
 | `Result` / `StepOutcome` | 确定状态、失败原因、业务键、各步处理结果与调用次数 |
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
-| `MemoryStore` | 内存状态存储实现 |
+| `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
+| `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
+| `MemoryStore` | 内存状态存储实现，同时实现 `Store` 与 `ClaimLeaseStore` |
 | `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果 |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
 
@@ -47,7 +49,9 @@
 
 - `ErrInvalidDefinition`：非法定义，或缺失业务键/外部幂等键；
 - `ErrExecutionNotFound`：查询未知执行身份；
-- `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义。
+- `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义；
+- `ErrClaimLeaseUnsupported`：`WithClaimLease` 启用了租约，但 Store 未实现 `ClaimLeaseStore`；
+- `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动。
 
 ## 最小用法
 
@@ -78,6 +82,15 @@ relay := txsaga.NewRelay(store, txsaga.PublisherFunc(func(ctx context.Context, e
 }))
 if _, err := relay.DeliverOnce(ctx); err != nil { /* ... */ }
 ```
+
+默认领取一经锁定即不可重领：worker 在 Ack/Nack 前退出会滞留事件。
+传入 `WithClaimLease(ttl)`（仅正时长生效）可启用租约：每次领取生成新的
+`ClaimID`，租约有效期内事件最多交给一次 `Publish`；worker 在 `Publish`、
+Ack 或 Nack 前退出时，事件于租约到期后的下一次 `DeliverOnce`/`Run`
+自动恢复重投，维持至少一次投递。领取后、`Publish` 前上下文取消会按当前
+`ClaimID` 立即 Nack；`Publish` 进行中取消则按其返回结果处理。Store 需
+实现 `ClaimLeaseStore`（`MemoryStore` 已实现），否则返回
+`ErrClaimLeaseUnsupported`。
 
 ## 示例
 

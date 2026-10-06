@@ -115,6 +115,54 @@ type Store interface {
 	NackEvent(ctx context.Context, eventID string) error
 }
 
+// ClaimLeaseStore 是在 Store 之上可选实现的带租约领取接口。
+//
+// 普通 ClaimPendingEvents 一旦领取即永久锁定（直到 Ack/Nack），worker 在
+// Publish、Ack 或 Nack 前退出会导致事件一直滞留领取中。带租约领取则为
+// 每次领取分配一个带过期时间的 ClaimID：有效期内事件不得被再次领取，
+// 到期后下一次领取自动恢复，失联事件据此重新投递（至少一次语义）。
+//
+// 只有持有当前 ClaimID 的调用方可 Ack 或 Nack；过期领取（旧 ClaimID）的
+// 操作返回 ErrStaleClaim，且不改动当前事件与新租约。
+type ClaimLeaseStore interface {
+	Store
+
+	// ClaimPendingEventsLeased 领取至多 max 条可投递事件（从未领取，或
+	// 此前的领取租约已到期）。每条事件获得一个新生成的 ClaimID 与从领取
+	// 成功起算的 ttl 租约，事件的 Deliveries 计数加一、LastAttemptAt 更新。
+	// max<=0 表示实现自选批量。
+	ClaimPendingEventsLeased(ctx context.Context, ttl time.Duration, max int) ([]ClaimedEvent, error)
+
+	// AckLeasedEvent 确认当前 claimID 对应的领取：事件被永久移除。
+	// claimID 不是该事件当前有效的领取时返回 ErrStaleClaim。
+	AckLeasedEvent(ctx context.Context, eventID, claimID string) error
+
+	// NackLeasedEvent 按当前 claimID 退回事件：解除当前租约，事件立即可被
+	// 再次领取（原事件字段与追加顺序保持不变）。claimID 不是该事件当前
+	// 有效领取时返回 ErrStaleClaim，且不改动事件与新租约。
+	NackLeasedEvent(ctx context.Context, eventID, claimID string) error
+}
+
+// ClaimedEvent 是一次带租约领取的结果。
+type ClaimedEvent struct {
+	// Event 被领取的事件副本（含更新后的 Deliveries/LastAttemptAt）。
+	Event *Event
+	// ClaimID 本次领取的唯一标识；只有持有它的调用方可 Ack/Nack。
+	ClaimID string
+	// ClaimedUntil 租约到期时刻；在此之前事件不会被再次领取。
+	ClaimedUntil time.Time
+}
+
+// 租约相关的哨兵错误，调用方可用 errors.Is 判定。
+var (
+	// ErrClaimLeaseUnsupported 启用了租约但 Store 未实现 ClaimLeaseStore。
+	ErrClaimLeaseUnsupported = errors.New("txsaga: store does not support claim leases")
+	// ErrStaleClaim Ack/Nack 携带的 ClaimID 已不是事件当前有效的领取
+	// （领取已到期、事件已被重新领取并获得新 ClaimID，或事件从未被该
+	// ClaimID 领取）。出现该错误时事件与当前租约不会被改动。
+	ErrStaleClaim = errors.New("txsaga: stale event claim")
+)
+
 // fingerprint 计算定义指纹：名称、版本与有序步骤名共同决定。
 // 动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
 func fingerprint(d Definition) string {
@@ -132,8 +180,15 @@ func fingerprint(d Definition) string {
 // ---- 内存实现 ----
 
 type memEvent struct {
-	event   Event
+	event Event
+
+	// 普通领取（ClaimPendingEvents）的锁定标记。
 	claimed bool
+
+	// 带租约领取的状态。claimID 非空表示存在一次领取；claimedUntil 之后
+	// 该领取失效，事件可被重新领取并获得新的 claimID。
+	claimID      string
+	claimedUntil time.Time
 }
 
 type memTx struct {
@@ -179,8 +234,15 @@ type MemoryStore struct {
 	events   map[string]*memEvent
 	pending  []string // 未领取事件 ID，保持追加顺序
 	seq      uint64
+	claimSeq uint64 // 租约 ClaimID 序列
 	now      func() time.Time
 }
+
+// 编译期断言：MemoryStore 同时满足 Store 与 ClaimLeaseStore。
+var (
+	_ Store           = (*MemoryStore)(nil)
+	_ ClaimLeaseStore = (*MemoryStore)(nil)
+)
 
 // NewMemoryStore 创建内存状态存储。
 func NewMemoryStore() *MemoryStore {
@@ -280,11 +342,22 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 	remaining := s.pending[:0]
 	for _, id := range s.pending {
 		me := s.events[id]
+		if me == nil {
+			continue // 已 Ack 移除，丢弃墓碑 ID
+		}
+		// 已被带租约领取且租约仍有效的事件不得被无租约领取再次取得。
+		if me.claimID != "" && now.Before(me.claimedUntil) {
+			remaining = append(remaining, id)
+			continue
+		}
 		if len(out) >= max {
 			remaining = append(remaining, id)
 			continue
 		}
 		me.claimed = true
+		// 接管已到期的租约事件时清除旧租约，避免遗留失效的 ClaimID。
+		me.claimID = ""
+		me.claimedUntil = time.Time{}
 		me.event.deliveries++
 		me.event.lastAttemptAt = now
 		cp := me.event
@@ -294,12 +367,74 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 	return out, nil
 }
 
+// ClaimPendingEventsLeased 实现 ClaimLeaseStore 接口。
+// 从未领取或当前租约已到期的事件可被领取；每次领取生成新的 ClaimID。
+// 租约内事件留在追加队列中原位跳过，因此到期恢复与 Nack 退回都不改变
+// 事件间的追加顺序；已 Ack 的事件 ID 作为墓碑在扫描时清除。
+func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Duration, max int) ([]ClaimedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if max <= 0 {
+		max = 16
+	}
+	now := s.now()
+	out := make([]ClaimedEvent, 0, max)
+	live := s.pending[:0]
+	for _, id := range s.pending {
+		me := s.events[id]
+		if me == nil {
+			continue // 已 Ack 移除，丢弃墓碑 ID
+		}
+		if me.claimID != "" && now.Before(me.claimedUntil) {
+			live = append(live, id) // 有效租约内：原位保留，本次跳过
+			continue
+		}
+		if len(out) >= max {
+			live = append(live, id) // 批量已满：保留顺序，下轮再领
+			continue
+		}
+		s.claimSeq++
+		cid := fmt.Sprintf("claim-%020d", s.claimSeq)
+		me.claimID = cid
+		me.claimedUntil = now.Add(ttl)
+		me.event.deliveries++
+		me.event.lastAttemptAt = now
+		cp := me.event
+		out = append(out, ClaimedEvent{
+			Event:        &cp,
+			ClaimID:      cid,
+			ClaimedUntil: me.claimedUntil,
+		})
+		live = append(live, id) // 租约期内留在队列，到期后原位可恢复
+	}
+	s.pending = live
+	return out, nil
+}
+
 // AckEvent 实现 Store 接口。
 func (s *MemoryStore) AckEvent(_ context.Context, eventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.events[eventID]; !ok {
 		return fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	delete(s.events, eventID)
+	return nil
+}
+
+// AckLeasedEvent 实现 ClaimLeaseStore 接口：仅当前 claimID 可确认。
+func (s *MemoryStore) AckLeasedEvent(_ context.Context, eventID, claimID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	me, ok := s.events[eventID]
+	if !ok {
+		return fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	if me.claimID != claimID {
+		// 含从未租约领取、旧 ClaimID 已到期、已被新领取取代三种情形，
+		// 均不得改动当前事件或新租约。
+		return fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, ErrStaleClaim)
 	}
 	delete(s.events, eventID)
 	return nil
@@ -321,11 +456,43 @@ func (s *MemoryStore) NackEvent(_ context.Context, eventID string) error {
 	return nil
 }
 
-// PendingCount 返回当前待领取事件数，便于观测与测试。
+// NackLeasedEvent 实现 ClaimLeaseStore 接口：仅当前 claimID 可退回，
+// 退回后租约解除、事件立即可领取，且保持原追加顺序。
+func (s *MemoryStore) NackLeasedEvent(_ context.Context, eventID, claimID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	me, ok := s.events[eventID]
+	if !ok {
+		return fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	if me.claimID != claimID {
+		return fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, ErrStaleClaim)
+	}
+	// 租约事件始终留在追加队列中，退回只解除租约：事件立即可领取，
+	// 且相对其它事件的顺序不变。
+	me.claimID = ""
+	me.claimedUntil = time.Time{}
+	return nil
+}
+
+// PendingCount 返回当前立即可领取的事件数（不含有效租约内的事件），
+// 便于观测与测试。
 func (s *MemoryStore) PendingCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.pending)
+	now := s.now()
+	n := 0
+	for _, id := range s.pending {
+		me := s.events[id]
+		if me == nil {
+			continue
+		}
+		if me.claimID != "" && now.Before(me.claimedUntil) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // TotalEvents 返回存储中全部事件数（含领取中、待投递）。

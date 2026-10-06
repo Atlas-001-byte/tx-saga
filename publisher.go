@@ -2,6 +2,7 @@ package txsaga
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -33,6 +34,9 @@ type Relay struct {
 	retryBackoff time.Duration
 	// idleWait 没有待投递事件时的轮询等待。
 	idleWait time.Duration
+	// leaseTTL > 0 时启用带租约领取：worker 在 Publish/Ack/Nack 前退出，
+	// 事件在租约到期后的下一轮自动恢复；0 表示沿用普通领取的默认行为。
+	leaseTTL time.Duration
 	// now 等时间依赖直接使用 time 包标准行为。
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -63,6 +67,21 @@ func WithIdleWait(d time.Duration) RelayOption {
 	return func(r *Relay) {
 		if d > 0 {
 			r.idleWait = d
+		}
+	}
+}
+
+// WithClaimLease 启用带租约领取并设置租约时长。
+//
+// 仅正时长生效；传入 0 或负时长不启用租约，Relay 沿用普通 ClaimPendingEvents
+// 的默认行为。启用后，每次领取的事件在 ttl 内不会被再次领取；worker 在
+// Publish、Ack 或 Nack 前退出时，事件于租约到期后的下一次 DeliverOnce/Run
+// 自动恢复重投，从而保证至少一次投递。Store 必须实现 ClaimLeaseStore，
+// 否则 DeliverOnce 返回 ErrClaimLeaseUnsupported（可 errors.Is）。
+func WithClaimLease(ttl time.Duration) RelayOption {
+	return func(r *Relay) {
+		if ttl > 0 {
+			r.leaseTTL = ttl
 		}
 	}
 }
@@ -106,7 +125,22 @@ type RelayResult struct {
 
 // DeliverOnce 执行一轮领取与投递，不阻塞等待。没有事件时立即返回空结果。
 // 单个事件发送失败不影响同批其它事件；失败事件被 Nack，可在后续轮次继续领取。
+//
+// 通过 WithClaimLease 启用租约且 Store 未实现 ClaimLeaseStore 时，
+// 返回包装了 ErrClaimLeaseUnsupported 的错误（可 errors.Is 判定）。
 func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
+	if r.leaseTTL > 0 {
+		leased, ok := r.store.(ClaimLeaseStore)
+		if !ok {
+			return RelayResult{}, ErrClaimLeaseUnsupported
+		}
+		return r.deliverOnceLeased(ctx, leased)
+	}
+	return r.deliverOnce(ctx)
+}
+
+// deliverOnce 是未启用租约时的默认路径：领取即锁定，失败立即退回。
+func (r *Relay) deliverOnce(ctx context.Context) (RelayResult, error) {
 	events, err := r.store.ClaimPendingEvents(ctx, r.batch)
 	if err != nil {
 		return RelayResult{}, err
@@ -128,6 +162,51 @@ func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
 		}
 		if err := r.store.AckEvent(ctx, ev.ID); err != nil {
 			return res, err
+		}
+		res.Delivered++
+	}
+	return res, nil
+}
+
+// deliverOnceLeased 是启用租约后的投递路径。
+//
+// 取消语义：
+//   - 领取后、Publish 前 ctx 已取消：事件从未交给 Publish，按当前 ClaimID
+//     立即 Nack，等不到租约到期；
+//   - Publish 进行中取消：按 Publish 的返回结果处理，nil 走 Ack，error 走
+//     Nack，不因 ctx 取消改变结论；
+//   - worker 在任何一步退出（未 Nack）：租约到期后事件自动恢复重投。
+//
+// Ack/Nack 使用独立上下文，避免调用方 ctx 已取消导致确认/退回被 Store
+// 拒绝而被迫等待租约到期。旧 ClaimID（租约已到期、事件被他人重新领取）
+// 返回 ErrStaleClaim 时不作任何操作：当前事件与新租约由接管方负责。
+func (r *Relay) deliverOnceLeased(ctx context.Context, store ClaimLeaseStore) (RelayResult, error) {
+	claims, err := store.ClaimPendingEventsLeased(ctx, r.leaseTTL, r.batch)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	res := RelayResult{Claimed: len(claims)}
+	for _, c := range claims {
+		if err := ctx.Err(); err != nil {
+			if nackErr := store.NackLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); nackErr != nil &&
+				!errors.Is(nackErr, ErrStaleClaim) {
+				return res, nackErr
+			}
+			res.Failed++
+			continue
+		}
+		pubErr := r.publisher.Publish(ctx, *c.Event)
+		if pubErr != nil {
+			if nackErr := store.NackLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); nackErr != nil &&
+				!errors.Is(nackErr, ErrStaleClaim) {
+				return res, nackErr
+			}
+			res.Failed++
+			continue
+		}
+		if ackErr := store.AckLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); ackErr != nil &&
+			!errors.Is(ackErr, ErrStaleClaim) {
+			return res, ackErr
 		}
 		res.Delivered++
 	}
