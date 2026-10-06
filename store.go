@@ -28,19 +28,24 @@ type StepState struct {
 // ExecutionState 是一次执行的完整持久状态，Store 的实现负责其持久化。
 // 本包不规定磁盘文件格式：实现可自行选择 JSON、数据库行等任何载体。
 type ExecutionState struct {
-	BusinessKey            string      `json:"business_key"`
-	SagaName               string      `json:"saga_name"`
-	IdempotencyKey         string      `json:"idempotency_key"`
-	Fingerprint            string      `json:"fingerprint"`
-	Status                 string      `json:"status"`
-	Steps                  []StepState `json:"steps"`
-	FailureReason          string      `json:"failure_reason,omitempty"`
-	FailedStep             string      `json:"failed_step,omitempty"`
-	CompensationError      string      `json:"compensation_error,omitempty"`
-	FailedCompensationStep string      `json:"failed_compensation_step,omitempty"`
-	Payload                any         `json:"-"`
-	CreatedAt              time.Time   `json:"created_at"`
-	UpdatedAt              time.Time   `json:"updated_at"`
+	BusinessKey    string      `json:"business_key"`
+	SagaName       string      `json:"saga_name"`
+	IdempotencyKey string      `json:"idempotency_key"`
+	Fingerprint    string      `json:"fingerprint"`
+	Status         string      `json:"status"`
+	Steps          []StepState `json:"steps"`
+	// SucceededOrder 记录各步骤确认成功的先后顺序（含之后被补偿的步骤），
+	// 补偿按该顺序的逆序进行；顺序模式下与声明顺序一致。事件负载中的
+	// SucceededSteps 快照与 ExecutionView.SucceededSteps 均取该顺序下
+	// 当前仍为成功状态的步骤。
+	SucceededOrder         []string  `json:"succeeded_order,omitempty"`
+	FailureReason          string    `json:"failure_reason,omitempty"`
+	FailedStep             string    `json:"failed_step,omitempty"`
+	CompensationError      string    `json:"compensation_error,omitempty"`
+	FailedCompensationStep string    `json:"failed_compensation_step,omitempty"`
+	Payload                any       `json:"-"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // Terminal 报告状态是否为固定终态。
@@ -163,13 +168,17 @@ var (
 	ErrStaleClaim = errors.New("txsaga: stale event claim")
 )
 
-// fingerprint 计算定义指纹：名称、版本与有序步骤名共同决定。
-// 动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
+// fingerprint 计算定义指纹：名称、版本、有序步骤名及各步骤声明的前置
+// （按声明顺序）共同决定。动作函数无可比较标识，调用方应通过 Name/Version
+// 区分不同实现。
 func fingerprint(d Definition) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "name=%s\x00version=%s", d.Name, d.Version)
 	for _, s := range d.Steps {
 		fmt.Fprintf(h, "\x00step=%s", s.Name)
+		for _, dep := range s.DependsOn {
+			fmt.Fprintf(h, "\x00dep=%s", dep)
+		}
 		if s.Compensate != nil {
 			h.Write([]byte("\x00comp=1"))
 		}
@@ -275,6 +284,9 @@ func cloneState(s *ExecutionState) *ExecutionState {
 	c := *s
 	if s.Steps != nil {
 		c.Steps = append([]StepState(nil), s.Steps...)
+	}
+	if s.SucceededOrder != nil {
+		c.SucceededOrder = append([]string(nil), s.SucceededOrder...)
 	}
 	return &c
 }

@@ -15,14 +15,19 @@
 
 - **Saga 编排**：按定义顺序执行未完成的正向步骤；一步确认成功后，
   先在同一事务中提交该步完成状态与事件，再执行下一步。
+- **依赖图并发（可选）**：任一步骤通过 `DependsOn` 声明前置步骤名称后，
+  整个定义进入依赖图模式——步骤在全部前置确认成功后才启动，无前置的
+  步骤同时启动、并发执行，某一步确认后立即调度因此就绪的后续步骤。
+  所有步骤都未声明前置时保持顺序模式，公开行为不变。
 - **有限重试（可选）**：每一步可分别为正向动作与补偿动作配置最大总调用次数
   与每次失败后的等待时长（`ActionRetry` / `CompensateRetry`）。未配置时
   仍是一步一次调用、失败即转补偿。重试期间的中间失败不提交状态、不追加
   事件；等待与动作都响应 `context`。
-- **补偿**：正向动作在重试预算内成功则继续推进；预算耗尽仍失败才停止推进，
-  仅按相反顺序补偿此前已确认成功的步骤；未执行到的步骤不补偿。补偿动作
-  同样可配置重试预算；预算耗尽仍报错则执行固定为 `compensation_failed`，
-  终态结果不再改变。
+- **补偿**：正向动作在重试预算内成功则继续推进；预算耗尽仍失败才停止推进
+  （依赖图模式下同时停止调度未启动步骤，已启动的兄弟动作跑完并照常提交），
+  仅按确认成功顺序的相反方向补偿已确认成功的步骤；未执行到或未确认的
+  步骤不补偿。补偿动作同样可配置重试预算；预算耗尽仍报错则执行固定为
+  `compensation_failed`，终态结果不再改变。
 - **执行幂等**：执行身份由业务键、Saga 定义与外部幂等键共同确定。
   同身份重试不重复执行已确认成功的正向步骤或补偿步骤；未确认结果的步骤
   允许被重新调用，动作自身遵守幂等契约。
@@ -40,7 +45,7 @@
 
 | 类型/函数 | 说明 |
 | --- | --- |
-| `Definition` / `Step` | Saga 定义：名称、版本、有序步骤；每步提供幂等 `Action`，可选 `Compensate`，并可分别为二者配置可选 `RetryPolicy` |
+| `Definition` / `Step` | Saga 定义：名称、版本、步骤列表；每步提供幂等 `Action`，可选 `Compensate`、可选 `DependsOn` 前置步骤（依赖图模式），并可分别为动作与补偿配置可选 `RetryPolicy` |
 | `RetryPolicy` | 单个动作的有限重试预算：`MaxAttempts` 最大总调用次数（含首次）、`RetryWait` 每次失败后的等待时长；零值按 1 次、0 等待处理 |
 | `ExecutionRequest` | 执行请求：业务键、外部幂等键、透传负载 |
 | `Result` / `StepOutcome` | 确定状态、失败原因、业务键、各步处理结果与调用次数 |
@@ -58,7 +63,8 @@
 
 哨兵错误（以 `errors.Is` 判定）：
 
-- `ErrInvalidDefinition`：非法定义（含负的重试次数/等待时长），或缺失业务键/外部幂等键；
+- `ErrInvalidDefinition`：非法定义（含负的重试次数/等待时长，以及前置步骤
+  未知、自依赖、重复前置、前置关系成环），或缺失业务键/外部幂等键；
 - `ErrExecutionNotFound`：查询未知执行身份；
 - `ErrDefinitionConflict`：相同业务键使用了不同 Saga 定义；
 - `ErrClaimLeaseUnsupported`：`WithClaimLease` 启用了租约，但 Store 未实现 `ClaimLeaseStore`；
@@ -103,6 +109,46 @@ result, err := engine.Execute(ctx, def, txsaga.ExecutionRequest{
     IdempotencyKey: "request-7a3f", // 外部幂等键
 })
 ```
+
+## 依赖图并发（可选）
+
+步骤可通过 `DependsOn` 声明前置步骤名称；定义中任一步骤声明前置后，
+整个定义进入依赖图模式：
+
+```go
+def := txsaga.Definition{
+    Name: "order-saga", Version: "v2",
+    Steps: []txsaga.Step{
+        {Name: "reserve", Action: reserve, Compensate: release},
+        {Name: "audit",   Action: audit},                          // 与 reserve 并发启动
+        {Name: "charge",  Action: charge, Compensate: refund,
+            DependsOn: []string{"reserve", "audit"}},              // 两者确认后才启动
+        {Name: "ship",    Action: ship,   DependsOn: []string{"charge"}},
+    },
+}
+```
+
+语义约定：
+
+- 步骤只有在**全部前置确认成功后**才可启动；无前置的步骤同时启动、并发
+  执行；某一步确认后立即调度因此就绪的后续步骤。所有步骤都未声明前置时
+  保持顺序模式，按声明顺序逐个执行，公开行为与此前版本一致。
+- 前置名称必须指向定义内已存在的其它步骤：未知前置、自依赖、重复前置或
+  前置关系成环时，`ValidateDefinition` 与 `Execute` 都返回
+  `ErrInvalidDefinition`，且不创建执行、不调用动作、不追加事件。
+  `DependsOn` 参与定义指纹，同业务键下变更前置关系会得到
+  `ErrDefinitionConflict`。
+- 任一正向动作预算耗尽仍失败：停止调度未启动步骤，已启动的兄弟动作继续
+  运行到返回并各自原子提交结果（成功步骤照常追加 `step_succeeded` 事件并
+  纳入补偿），随后按**确认成功顺序的逆序**补偿；未执行到或未确认的步骤
+  不补偿。顺序模式下确认顺序即声明顺序，补偿顺序与此前版本一致。
+- 每个动作仍须遵守幂等契约；`ActionRetry` / `CompensateRetry` 在单步内
+  继续生效，中间失败不追加事件。事件负载中的 `SucceededSteps` 快照与
+  `ExecutionView.SucceededSteps()` 均按确认成功的先后顺序排列；
+  `Result.Steps` 始终按 `Definition.Steps` 声明顺序返回。
+- `context` 在动作或等待中取消时：不确认当前动作、不调度新的兄弟步骤，
+  已提交状态与既有事件不变；以同一业务键、Saga 定义与外部幂等键再次
+  调用即可继续处理未确认部分。
 
 ## 有限重试
 

@@ -65,7 +65,7 @@ const (
 // 哨兵错误，调用方可用 errors.Is 判定。
 var (
 	// ErrInvalidDefinition 定义非法（名称为空、步骤为空、步骤名为空、
-	// 缺少正向动作）或执行请求缺少外部幂等键。
+	// 缺少正向动作、前置步骤未知/自依赖/重复/成环）或执行请求缺少外部幂等键。
 	ErrInvalidDefinition = errors.New("txsaga: invalid saga definition")
 	// ErrExecutionNotFound 未知执行身份：该业务键下不存在由给定 Saga 定义
 	// 与外部幂等键标识的执行。
@@ -107,6 +107,14 @@ type RetryPolicy struct {
 type Step struct {
 	// Name 步骤在 Saga 内唯一的名称。
 	Name string
+	// DependsOn 本步骤的前置步骤名称列表：全部前置步骤确认成功后本步骤
+	// 才可启动。为空表示无前置，可与其它无前置步骤同时启动。
+	// 一旦定义中任一步骤声明了前置，整个定义进入依赖图模式：调度只依据
+	// 各步骤声明的前置关系，无前置的步骤并发执行；所有步骤都未声明前置时
+	// 仍按 Steps 声明顺序逐个执行（顺序模式，公开行为与此前版本一致）。
+	// 前置名称必须指向定义内已存在的其它步骤：未知前置、自依赖、重复前置
+	// 或前置关系成环均属非法定义。
+	DependsOn []string
 	// Action 正向幂等动作，必填。
 	Action ActionFunc
 	// Compensate 反向补偿动作；无需补偿的步骤可留空，留空视为补偿成功。
@@ -138,7 +146,9 @@ type Definition struct {
 	Name string
 	// Version 定义版本，参与定义指纹以区分同名但内容不同的定义。
 	Version string
-	// Steps 按正向执行顺序排列的步骤，至少一个。
+	// Steps Saga 的全部步骤，至少一个。未声明任何前置（DependsOn 均为空）时
+	// 按声明顺序逐个执行；任一步骤声明前置后进入依赖图模式，按前置关系调度，
+	// 无前置的步骤并发执行。Result.Steps 始终按本切片声明顺序返回。
 	Steps []Step
 }
 
@@ -207,7 +217,8 @@ type ExecutionView interface {
 	IdempotencyKey() string
 	// Payload 返回发起执行时透传的结构化负载。
 	Payload() any
-	// SucceededSteps 返回截至当前已确认成功的步骤名（按成功顺序）。
+	// SucceededSteps 返回截至当前已确认成功的步骤名（按确认成功的先后
+	// 顺序；顺序模式下与声明顺序一致）。
 	SucceededSteps() []string
 }
 
