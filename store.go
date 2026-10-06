@@ -163,7 +163,7 @@ var (
 	ErrStaleClaim = errors.New("txsaga: stale event claim")
 )
 
-// fingerprint 计算定义指纹：名称、版本与有序步骤名共同决定。
+// fingerprint 计算定义指纹：名称、版本、有序步骤名与各步重试策略共同决定。
 // 动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
 func fingerprint(d Definition) string {
 	h := sha256.New()
@@ -173,6 +173,10 @@ func fingerprint(d Definition) string {
 		if s.Compensate != nil {
 			h.Write([]byte("\x00comp=1"))
 		}
+		actionMax, actionWait := s.ActionRetry.resolved()
+		compMax, compWait := s.CompensationRetry.resolved()
+		fmt.Fprintf(h, "\x00aretry=%d/%d\x00cretry=%d/%d",
+			actionMax, int64(actionWait), compMax, int64(compWait))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

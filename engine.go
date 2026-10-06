@@ -8,7 +8,9 @@ import (
 )
 
 // ValidateDefinition 校验 Saga 定义，非法时返回 ErrInvalidDefinition（可 errors.Is）。
-// 规则：名称非空、至少一个步骤、每个步骤名非空且不重复、每个步骤都提供正向动作。
+// 规则：名称非空、至少一个步骤、每个步骤名非空且不重复、每个步骤都提供
+// 正向动作；每个步骤的正向/补偿重试策略必须满足：MaxAttempts>=0
+// （零值按 1 处理，负值非法）、RetryWait>=0（负值非法）。
 func ValidateDefinition(d Definition) error {
 	if strings.TrimSpace(d.Name) == "" {
 		return ErrInvalidDefinition
@@ -25,6 +27,10 @@ func ValidateDefinition(d Definition) error {
 			return ErrInvalidDefinition
 		}
 		seen[st.Name] = struct{}{}
+		if st.ActionRetry.MaxAttempts < 0 || st.ActionRetry.RetryWait < 0 ||
+			st.CompensationRetry.MaxAttempts < 0 || st.CompensationRetry.RetryWait < 0 {
+			return ErrInvalidDefinition
+		}
 	}
 	return nil
 }
@@ -39,11 +45,18 @@ type Engine struct {
 
 	// now 为可注入时钟；生产使用 time.Now。
 	now func() time.Time
+	// sleep 在两次动作调用间等待，返回 context 的错误表示等待被取消。
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // NewEngine 创建基于 store 的编排引擎。
 func NewEngine(store Store) *Engine {
-	return &Engine{store: store, locks: make(map[string]*sync.Mutex), now: time.Now}
+	return &Engine{
+		store: store,
+		locks: make(map[string]*sync.Mutex),
+		now:   time.Now,
+		sleep: sleepWithContext,
+	}
 }
 
 func (e *Engine) identityLock(businessKey, idempotencyKey string) *sync.Mutex {
@@ -90,8 +103,16 @@ func (v execView) SucceededSteps() []string {
 //   - 非法定义或缺失业务键/幂等键：返回 ErrInvalidDefinition。
 //
 // 每一步确认后，状态与对应 Outbox 事件在同一个 Store 事务中原子提交，
-// 然后才执行下一步。正向动作失败即停止推进，仅逆序补偿此前确认成功的步骤；
-// 任一补偿报错则固定为 compensation_failed 终态。
+// 然后才执行下一步。正向动作按该步配置的重试策略在预算内重复调用；预算
+// 耗尽仍失败才停止推进，仅逆序补偿此前确认成功的步骤。补偿动作同样按其
+// 重试策略在预算内重试，任一补偿预算耗尽仍报错则固定为
+// compensation_failed 终态。重试期间的中间失败不追加任何事件：事件仍只
+// 在状态确认时原子提交。
+//
+// 未配置重试时 MaxAttempts 按 1、RetryWait 按 0 处理，与一步一次调用、
+// 失败即转补偿的默认语义一致。等待重试或动作执行期间 context 取消时，
+// Execute 返回 context 的错误，不确认该动作、不启动补偿，也不改变已经
+// 提交的执行状态；后续同身份调用可继续执行。
 func (e *Engine) Execute(ctx context.Context, def Definition, req ExecutionRequest) (Result, error) {
 	if err := ValidateDefinition(def); err != nil {
 		return Result{}, err
@@ -187,8 +208,13 @@ func (e *Engine) createExecution(ctx context.Context, def Definition, fp string,
 	})
 }
 
-// advanceForward 执行下一个未完成的正向步骤，在事务外调用动作，再把
-// 成功/失败结果与事件原子提交。返回 false 表示已无待执行步骤。
+// advanceForward 执行下一个未完成的正向步骤，在事务外按重试策略调用动作，
+// 再把成功/最终失败结果与事件原子提交。返回 false 表示已无待执行步骤。
+//
+// 动作每次返回非 nil 错误且仍有剩余次数时，等待该步配置的时长后再次调用
+// 同一动作；等待与动作都响应 context。等待期间 context 取消，或动作以
+// context 错误结束且外层 context 已取消时，直接返回该取消错误：不确认
+// 该动作、不提交状态、不启动补偿，已提交的执行状态保持不变。
 func (e *Engine) advanceForward(ctx context.Context, def Definition, req ExecutionRequest, st *ExecutionState) (bool, error) {
 	idx := -1
 	for i := range st.Steps {
@@ -201,20 +227,40 @@ func (e *Engine) advanceForward(ctx context.Context, def Definition, req Executi
 		return false, nil
 	}
 	step := def.Steps[idx]
+	maxAttempts, retryWait := step.ActionRetry.resolved()
 
-	// Attempts 记录该步骤动作的实际调用次数；同身份重试已确认步骤时不会自增。
-	// 未确认结果的步骤被重新调用时该值增大，调用方据此判断是否发生重复处理。
-	st.Steps[idx].Attempts++
-	st.Steps[idx].StartedAt = e.now()
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	actionErr := step.Action(ctx, execView{state: st, payload: req.Payload})
-	if err := ctx.Err(); err != nil {
-		// 调用方取消：不把取消解释为业务失败，未确认的步骤留待后续同身份重试。
-		return false, err
+	// Attempts 记录该步骤动作的实际总调用次数；同身份重试已确认步骤时不会
+	// 自增。未确认结果的步骤被重新调用（含本次调用内的重试与跨调用续跑）
+	// 时该值增大，调用方据此判断是否发生重复处理。
+	startedAt := e.now()
+	var actionErr error
+	calls := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		st.Steps[idx].Attempts++
+		calls++
+		actionErr = step.Action(ctx, execView{state: st, payload: req.Payload})
+		if actionErr == nil {
+			break
+		}
+		// 动作以 context 错误结束且外层 context 已取消：不视为业务失败，
+		// 未确认的步骤留待后续同身份重试，也不进入补偿。
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if calls >= maxAttempts {
+			break
+		}
+		if retryWait > 0 {
+			if err := e.sleep(ctx, retryWait); err != nil {
+				return false, err
+			}
+		}
 	}
 	finishedAt := e.now()
+	st.Steps[idx].StartedAt = startedAt
 
 	err := e.store.Commit(ctx, req.BusinessKey, req.IdempotencyKey, func(tx Tx) error {
 		cur := tx.State()
@@ -223,7 +269,7 @@ func (e *Engine) advanceForward(ctx context.Context, def Definition, req Executi
 		}
 		cs := &cur.Steps[idx]
 		cs.Attempts = st.Steps[idx].Attempts
-		cs.StartedAt = st.Steps[idx].StartedAt
+		cs.StartedAt = startedAt
 		cs.FinishedAt = finishedAt
 
 		if actionErr == nil {
@@ -267,7 +313,9 @@ func (e *Engine) advanceForward(ctx context.Context, def Definition, req Executi
 
 // advanceCompensation 逆序补偿下一个已确认成功的步骤。
 // 返回 done=true 表示已无待补偿步骤，调用方应把执行收束为 failed 终态。
-// 补偿动作返回错误时，执行在同一事务中固定为 compensation_failed 终态。
+// 补偿动作按该步配置的重试策略在预算内重复调用；预算耗尽仍返回错误时，
+// 执行在同一事务中固定为 compensation_failed 终态。等待与动作都响应
+// context，取消时不确认本次补偿、不改变已提交状态。
 func (e *Engine) advanceCompensation(ctx context.Context, def Definition, req ExecutionRequest, st *ExecutionState) (bool, error) {
 	idx := -1
 	for i := len(st.Steps) - 1; i >= 0; i-- {
@@ -284,13 +332,29 @@ func (e *Engine) advanceCompensation(ctx context.Context, def Definition, req Ex
 	var compErr error
 	calledCompensation := step.Compensate != nil
 	if calledCompensation {
-		st.Steps[idx].CompensationAttempts++
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		compErr = step.Compensate(ctx, execView{state: st, payload: req.Payload})
-		if err := ctx.Err(); err != nil {
-			return false, err
+		maxAttempts, retryWait := step.CompensationRetry.resolved()
+		calls := 0
+		for {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			st.Steps[idx].CompensationAttempts++
+			calls++
+			compErr = step.Compensate(ctx, execView{state: st, payload: req.Payload})
+			if compErr == nil {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if calls >= maxAttempts {
+				break
+			}
+			if retryWait > 0 {
+				if err := e.sleep(ctx, retryWait); err != nil {
+					return false, err
+				}
+			}
 		}
 	}
 	var compensatedAt time.Time

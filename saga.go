@@ -65,7 +65,7 @@ const (
 // 哨兵错误，调用方可用 errors.Is 判定。
 var (
 	// ErrInvalidDefinition 定义非法（名称为空、步骤为空、步骤名为空、
-	// 缺少正向动作）或执行请求缺少外部幂等键。
+	// 缺少正向动作、重试次数小于 1 或重试等待为负）或执行请求缺少外部幂等键。
 	ErrInvalidDefinition = errors.New("txsaga: invalid saga definition")
 	// ErrExecutionNotFound 未知执行身份：该业务键下不存在由给定 Saga 定义
 	// 与外部幂等键标识的执行。
@@ -77,17 +77,44 @@ var (
 
 // ActionFunc 是一个步骤的正向幂等动作。
 //
-// 动作必须遵守幂等契约：同一步骤在进程崩溃、调用超时后可能被再次调用，
-// 重复调用不得产生重复的业务效果。动作返回 nil 即视为该步骤确认成功，
-// 之后引擎先提交成功状态，再执行下一步。
+// 动作必须遵守幂等契约：同一步骤在进程崩溃、调用超时或配置的重试预算内
+// 可能被再次调用，重复调用不得产生重复的业务效果。动作返回 nil 即视为
+// 该步骤确认成功，之后引擎先提交成功状态，再执行下一步。
 type ActionFunc func(ctx context.Context, exec ExecutionView) error
 
 // CompensationFunc 是已确认成功步骤的补偿幂等动作。
 //
-// 补偿按步骤成功顺序的相反方向逐个执行。补偿同样可能被重复调用，
-// 实现必须自身幂等。返回 nil 表示补偿确认成功；返回错误时执行固定在
-// compensation_failed 终态，未确认的补偿允许在后续调用中重试（终态结果不变）。
+// 补偿按步骤成功顺序的相反方向逐个执行。补偿同样可能被重复调用（含配置的
+// 重试预算内重复调用），实现必须自身幂等。返回 nil 表示补偿确认成功；
+// 重试预算耗尽仍返回错误时执行固定在 compensation_failed 终态，未确认的
+// 补偿允许在后续调用中重试（终态结果不变）。
 type CompensationFunc func(ctx context.Context, exec ExecutionView) error
+
+// RetryPolicy 配置单个动作的可选有限重试。
+//
+// 零值即默认语义：动作最多被调用 1 次，失败后不等待。每次动作返回非 nil
+// 错误且仍有剩余次数时，引擎在等待 RetryWait 后再次调用同一动作；等待与
+// 动作调用本身都响应传入的 context。MaxAttempts 按“最大总调用次数”解释，
+// 例如 MaxAttempts=3 表示首次调用失败后最多再重试 2 次。
+//
+// 未配置（零值字段）时 MaxAttempts 按 1、RetryWait 按 0 处理；
+// MaxAttempts<1 或 RetryWait<0 属于非法定义，ValidateDefinition 与
+// Execute 均返回 ErrInvalidDefinition。
+type RetryPolicy struct {
+	// MaxAttempts 动作的最大总调用次数（含首次）；零值按 1 处理，小于 1 非法。
+	MaxAttempts int
+	// RetryWait 每次失败后、下一次调用前的等待时长；零值表示立即重试，负值非法。
+	// 等待期间 context 取消则 Execute 返回 context 的错误，动作不被确认。
+	RetryWait time.Duration
+}
+
+func (p RetryPolicy) resolved() (int, time.Duration) {
+	n := p.MaxAttempts
+	if n < 1 {
+		n = 1
+	}
+	return n, p.RetryWait
+}
 
 // Step 定义 Saga 中的一个正向步骤及其补偿。
 type Step struct {
@@ -97,6 +124,12 @@ type Step struct {
 	Action ActionFunc
 	// Compensate 反向补偿动作；无需补偿的步骤可留空，留空视为补偿成功。
 	Compensate CompensationFunc
+	// ActionRetry 正向动作的有限重试策略；零值表示调用一次、失败即转补偿。
+	ActionRetry RetryPolicy
+	// CompensationRetry 补偿动作的有限重试策略；零值表示补偿只调用一次。
+	// 补偿在重试预算内成功则继续逆序补偿；预算耗尽仍失败则执行固定在
+	// compensation_failed 终态。
+	CompensationRetry RetryPolicy
 }
 
 // Definition 是一个 Saga 的不可变定义。
@@ -125,16 +158,18 @@ type StepOutcome struct {
 	Name string `json:"name"`
 	// Result 取值为 StepResult* 常量。
 	Result string `json:"result"`
-	// Attempts 正向动作的实际调用次数；同身份重试已确认步骤时保持不变，
-	// 大于 1 说明该未确认步骤曾被重复调用（动作须幂等）。
+	// Attempts 正向动作的实际总调用次数（含同一次 Execute 内按重试策略
+	// 发起的重复调用）；同身份重试已确认步骤时保持不变。大于 1 说明该
+	// 未确认步骤曾被重复调用（配置重试或同身份续跑），动作须幂等。
 	Attempts int `json:"attempts"`
-	// CompensationAttempts 补偿动作的实际调用次数；已确认补偿后保持不变。
+	// CompensationAttempts 补偿动作的实际总调用次数（含重试预算内的重复
+	// 调用）；已确认补偿后保持不变。
 	CompensationAttempts int `json:"compensation_attempts,omitempty"`
 	// Error 最近一次失败原因；成功时为空。
 	Error string `json:"error,omitempty"`
-	// StartedAt 最近一次开始执行正向动作的时间，未执行过为零值。
+	// StartedAt 首次开始执行正向动作的时间，未执行过为零值。
 	StartedAt time.Time `json:"started_at,omitempty"`
-	// FinishedAt 最近一次正向动作返回的时间，未完成则为零值。
+	// FinishedAt 最近一次正向动作返回（成功或最终失败）的时间，未完成则为零值。
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
 
