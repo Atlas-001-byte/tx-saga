@@ -28,19 +28,24 @@ type StepState struct {
 // ExecutionState 是一次执行的完整持久状态，Store 的实现负责其持久化。
 // 本包不规定磁盘文件格式：实现可自行选择 JSON、数据库行等任何载体。
 type ExecutionState struct {
-	BusinessKey            string      `json:"business_key"`
-	SagaName               string      `json:"saga_name"`
-	IdempotencyKey         string      `json:"idempotency_key"`
-	Fingerprint            string      `json:"fingerprint"`
-	Status                 string      `json:"status"`
-	Steps                  []StepState `json:"steps"`
-	FailureReason          string      `json:"failure_reason,omitempty"`
-	FailedStep             string      `json:"failed_step,omitempty"`
-	CompensationError      string      `json:"compensation_error,omitempty"`
-	FailedCompensationStep string      `json:"failed_compensation_step,omitempty"`
-	Payload                any         `json:"-"`
-	CreatedAt              time.Time   `json:"created_at"`
-	UpdatedAt              time.Time   `json:"updated_at"`
+	BusinessKey    string      `json:"business_key"`
+	SagaName       string      `json:"saga_name"`
+	IdempotencyKey string      `json:"idempotency_key"`
+	Fingerprint    string      `json:"fingerprint"`
+	Status         string      `json:"status"`
+	Steps          []StepState `json:"steps"`
+	// SucceededOrder 是已确认成功步骤的确认顺序快照：每有一个正向步骤的
+	// 成功状态被原子提交，就把其步骤名追加到末尾，之后不再变动。
+	// 依赖图模式下并发确认的顺序由各自成功事务的提交顺序决定；补偿严格按
+	// 本快照逆序枚举。顺序模式下与 Steps 声明顺序一致。
+	SucceededOrder         []string  `json:"succeeded_order,omitempty"`
+	FailureReason          string    `json:"failure_reason,omitempty"`
+	FailedStep             string    `json:"failed_step,omitempty"`
+	CompensationError      string    `json:"compensation_error,omitempty"`
+	FailedCompensationStep string    `json:"failed_compensation_step,omitempty"`
+	Payload                any       `json:"-"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // Terminal 报告状态是否为固定终态。
@@ -163,8 +168,8 @@ var (
 	ErrStaleClaim = errors.New("txsaga: stale event claim")
 )
 
-// fingerprint 计算定义指纹：名称、版本与有序步骤名共同决定。
-// 动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
+// fingerprint 计算定义指纹：名称、版本、有序步骤名与各步声明的前置依赖
+// 共同决定。动作函数无可比较标识，调用方应通过 Name/Version 区分不同实现。
 func fingerprint(d Definition) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "name=%s\x00version=%s", d.Name, d.Version)
@@ -172,6 +177,11 @@ func fingerprint(d Definition) string {
 		fmt.Fprintf(h, "\x00step=%s", s.Name)
 		if s.Compensate != nil {
 			h.Write([]byte("\x00comp=1"))
+		}
+		// 前置依赖按声明顺序计入指纹：增删依赖或调整依赖集合即视为另一版定义，
+		// 同业务键再次执行会得到 ErrDefinitionConflict。
+		for _, dep := range s.DependsOn {
+			fmt.Fprintf(h, "\x00dep=%s", dep)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -275,6 +285,9 @@ func cloneState(s *ExecutionState) *ExecutionState {
 	c := *s
 	if s.Steps != nil {
 		c.Steps = append([]StepState(nil), s.Steps...)
+	}
+	if s.SucceededOrder != nil {
+		c.SucceededOrder = append([]string(nil), s.SucceededOrder...)
 	}
 	return &c
 }

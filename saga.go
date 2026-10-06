@@ -111,6 +111,14 @@ type Step struct {
 	Action ActionFunc
 	// Compensate 反向补偿动作；无需补偿的步骤可留空，留空视为补偿成功。
 	Compensate CompensationFunc
+	// DependsOn 声明本步骤的前置步骤名称：仅当全部前置步骤都已确认成功后，
+	// 本步骤的正向动作才会启动；前置全部确认前本步骤保持 pending。
+	// 留空表示无前置步骤。无环依赖图中相互没有依赖关系的步骤会并发执行，
+	// 每个步骤的成功状态与事件仍各自在独立 Store 事务中原子提交。
+	// 所有步骤均未声明依赖时，编排退化为按 Steps 声明顺序逐个执行的顺序模式，
+	// 公开行为与不使用依赖图时完全一致。
+	// 依赖未知步骤、依赖自身、重复列出同一前置或依赖成环均为非法定义。
+	DependsOn []string
 	// ActionRetry 正向动作的可选有限重试配置；零值表示只调用一次、失败即转补偿。
 	ActionRetry RetryPolicy
 	// CompensateRetry 补偿动作的可选有限重试配置；零值表示只调用一次、
@@ -139,6 +147,9 @@ type Definition struct {
 	// Version 定义版本，参与定义指纹以区分同名但内容不同的定义。
 	Version string
 	// Steps 按正向执行顺序排列的步骤，至少一个。
+	// 各步可通过 Step.DependsOn 声明前置步骤：未声明任何依赖时严格按本切片
+	// 顺序串行执行；声明依赖后按依赖图调度，无依赖关系的步骤并发执行。
+	// 无论是否使用依赖图，Result.Steps 与补偿枚举顺序都以本切片的声明顺序为准。
 	Steps []Step
 }
 
@@ -207,7 +218,9 @@ type ExecutionView interface {
 	IdempotencyKey() string
 	// Payload 返回发起执行时透传的结构化负载。
 	Payload() any
-	// SucceededSteps 返回截至当前已确认成功的步骤名（按成功顺序）。
+	// SucceededSteps 返回截至当前已确认成功的步骤名，顺序为各步成功被
+	// 原子提交的先后（确认顺序）。依赖图模式下并发确认的步骤按其成功事务
+	// 的提交顺序排列；顺序模式下即步骤声明顺序。
 	SucceededSteps() []string
 }
 
