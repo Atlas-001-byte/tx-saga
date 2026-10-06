@@ -89,6 +89,20 @@ type ActionFunc func(ctx context.Context, exec ExecutionView) error
 // compensation_failed 终态，未确认的补偿允许在后续调用中重试（终态结果不变）。
 type CompensationFunc func(ctx context.Context, exec ExecutionView) error
 
+// RetryPolicy 配置一个动作的有限重试预算。
+//
+// 零值即默认语义：动作只调用一次（MaxAttempts 视为 1），失败后不等待。
+// 每次动作返回非 nil 错误且仍有剩余次数时，引擎等待 RetryWait 后再次调用
+// 同一动作；等待与动作本身都响应传入的 context。MaxAttempts 是包含首次
+// 调用在内的最大总调用次数；负数次数或负等待时长属于非法定义。
+type RetryPolicy struct {
+	// MaxAttempts 最大总调用次数（含首次）。零值按 1 处理；负数为非法定义。
+	MaxAttempts int
+	// RetryWait 每次失败后、再次调用前的等待时长。零值表示立即重试；
+	// 负数为非法定义。
+	RetryWait time.Duration
+}
+
 // Step 定义 Saga 中的一个正向步骤及其补偿。
 type Step struct {
 	// Name 步骤在 Saga 内唯一的名称。
@@ -97,6 +111,25 @@ type Step struct {
 	Action ActionFunc
 	// Compensate 反向补偿动作；无需补偿的步骤可留空，留空视为补偿成功。
 	Compensate CompensationFunc
+	// ActionRetry 正向动作的可选有限重试配置；零值表示只调用一次、失败即转补偿。
+	ActionRetry RetryPolicy
+	// CompensateRetry 补偿动作的可选有限重试配置；零值表示只调用一次、
+	// 失败即固定为 compensation_failed。
+	CompensateRetry RetryPolicy
+}
+
+// retryBudget 是归一化后的重试预算。
+type retryBudget struct {
+	maxAttempts int
+	wait        time.Duration
+}
+
+func normalizeRetry(p RetryPolicy) retryBudget {
+	n := p.MaxAttempts
+	if n < 1 {
+		n = 1
+	}
+	return retryBudget{maxAttempts: n, wait: p.RetryWait}
 }
 
 // Definition 是一个 Saga 的不可变定义。
@@ -125,10 +158,12 @@ type StepOutcome struct {
 	Name string `json:"name"`
 	// Result 取值为 StepResult* 常量。
 	Result string `json:"result"`
-	// Attempts 正向动作的实际调用次数；同身份重试已确认步骤时保持不变，
-	// 大于 1 说明该未确认步骤曾被重复调用（动作须幂等）。
+	// Attempts 正向动作在本次确认阶段的实际调用次数（含预算内重试）；
+	// 同身份重试已确认步骤时保持不变，大于 1 说明该步曾在预算内重试，
+	// 或未确认步骤被同身份调用重新进入（动作须幂等）。
 	Attempts int `json:"attempts"`
-	// CompensationAttempts 补偿动作的实际调用次数；已确认补偿后保持不变。
+	// CompensationAttempts 补偿动作在本次确认阶段的实际调用次数（含预算内
+	// 重试）；已确认补偿后保持不变。
 	CompensationAttempts int `json:"compensation_attempts,omitempty"`
 	// Error 最近一次失败原因；成功时为空。
 	Error string `json:"error,omitempty"`
