@@ -202,6 +202,14 @@ type memEvent struct {
 	// 该领取失效，事件可被重新领取并获得新的 claimID。
 	claimID      string
 	claimedUntil time.Time
+
+	// 死信状态。deadLettered 为 true 表示事件已达投递上限被隔离：退出
+	// 普通领取，只能经 RequeueDeadLetter 重新入队。deadLetterReason 与
+	// deadLetteredAt 记录最近一次进入死信的原因与时刻，重新入队后作为
+	// 历史失败信息保留，不回退。
+	deadLettered     bool
+	deadLetterReason string
+	deadLetteredAt   time.Time
 }
 
 type memTx struct {
@@ -256,11 +264,13 @@ type MemoryStore struct {
 	now      func() time.Time
 }
 
-// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore 与 EventHistoryStore。
+// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore、EventHistoryStore
+// 与 DeadLetterStore。
 var (
 	_ Store             = (*MemoryStore)(nil)
 	_ ClaimLeaseStore   = (*MemoryStore)(nil)
 	_ EventHistoryStore = (*MemoryStore)(nil)
+	_ DeadLetterStore   = (*MemoryStore)(nil)
 )
 
 // NewMemoryStore 创建内存状态存储。
@@ -368,8 +378,8 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 	remaining := s.pending[:0]
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
-			continue // 已 Ack 移除，丢弃墓碑 ID
+		if me == nil || me.deadLettered {
+			continue // 已 Ack 移除或已转死信，丢弃墓碑 ID
 		}
 		// 已被带租约领取且租约仍有效的事件不得被无租约领取再次取得。
 		if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -385,6 +395,7 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 		me.claimID = ""
 		me.claimedUntil = time.Time{}
 		me.event.deliveries++
+		me.event.roundDeliveries++
 		me.event.lastAttemptAt = now
 		cp := me.event
 		out = append(out, &cp)
@@ -409,8 +420,8 @@ func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Durat
 	live := s.pending[:0]
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
-			continue // 已 Ack 移除，丢弃墓碑 ID
+		if me == nil || me.deadLettered {
+			continue // 已 Ack 移除或已转死信，丢弃墓碑 ID
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {
 			live = append(live, id) // 有效租约内：原位保留，本次跳过
@@ -425,6 +436,7 @@ func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Durat
 		me.claimID = cid
 		me.claimedUntil = now.Add(ttl)
 		me.event.deliveries++
+		me.event.roundDeliveries++
 		me.event.lastAttemptAt = now
 		cp := me.event
 		out = append(out, ClaimedEvent{
@@ -501,7 +513,91 @@ func (s *MemoryStore) NackLeasedEvent(_ context.Context, eventID, claimID string
 	return nil
 }
 
-// PendingCount 返回当前立即可领取的事件数（不含有效租约内的事件），
+// FailEvent 实现 DeadLetterStore 接口：退回一次失败投递，本轮领取次数
+// 达到 maxDeliveries 时在同一临界区内转为死信并退出普通领取。
+func (s *MemoryStore) FailEvent(_ context.Context, eventID, claimID, reason string, maxDeliveries int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	me, ok := s.events[eventID]
+	if !ok {
+		return false, fmt.Errorf("txsaga: event %q not found", eventID)
+	}
+	if claimID != "" {
+		// 租约口径：仅当前 ClaimID 可退回/转死信，过期领取不得改动事件。
+		if me.claimID != claimID {
+			return false, fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, ErrStaleClaim)
+		}
+	} else if !me.claimed {
+		return false, nil // 与 NackEvent 一致的幂等退回：未在领取中无需处理
+	}
+	if maxDeliveries > 0 && me.event.roundDeliveries >= maxDeliveries {
+		// 达到上限：解除领取并隔离为死信。死信事件不再进入任何领取扫描
+		// （租约路径遗留的队列 ID 在下次扫描时作为墓碑丢弃）。
+		me.deadLettered = true
+		me.deadLetterReason = reason
+		me.deadLetteredAt = s.now()
+		me.claimed = false
+		me.claimID = ""
+		me.claimedUntil = time.Time{}
+		return true, nil
+	}
+	// 未达上限：按对应领取口径退回，允许继续领取。
+	if claimID != "" {
+		me.claimID = ""
+		me.claimedUntil = time.Time{}
+	} else {
+		me.claimed = false
+		s.pending = append(s.pending, eventID)
+	}
+	return false, nil
+}
+
+// RequeueDeadLetter 实现 DeadLetterStore 接口：仅死信事件可重新入队。
+// 与领取、Ack、Nack 共用同一把锁，原子互斥。
+func (s *MemoryStore) RequeueDeadLetter(ctx context.Context, eventID string) error {
+	if err := ctx.Err(); err != nil {
+		return err // 取消：不改变任何事件
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 已 Ack 的事件不在活动索引中，但审计链保留其副本；重新入队入口必须
+	// 能对“已投递”给出 ErrEventNotDeadLettered 而非 ErrEventNotFound。
+	me, ok := s.events[eventID]
+	if !ok {
+		for _, h := range s.history {
+			if h.event.ID == eventID {
+				me = h
+				break
+			}
+		}
+		if me == nil {
+			return fmt.Errorf("txsaga: event %q: %w", eventID, ErrEventNotFound)
+		}
+	}
+	if !me.deadLettered {
+		return fmt.Errorf("txsaga: event %q: %w", eventID, ErrEventNotDeadLettered)
+	}
+	// 清除领取锁并回到待投递：本轮次数从零重新计数，累计 Deliveries、
+	// 最近领取时间与死信历史信息保留。不追加新事件，审计链顺序不变。
+	me.deadLettered = false
+	me.claimed = false
+	me.claimID = ""
+	me.claimedUntil = time.Time{}
+	me.event.roundDeliveries = 0
+	// 租约路径的死信事件可能仍在队列中留有墓碑（下次领取扫描时才清除），
+	// 先剔除再入队，保证同一事件在队列中始终只有一份。
+	remaining := s.pending[:0]
+	for _, id := range s.pending {
+		if id != eventID {
+			remaining = append(remaining, id)
+		}
+	}
+	s.pending = append(remaining, eventID)
+	return nil
+}
+
+// PendingCount 返回当前立即可领取的事件数（不含有效租约内与已死信的事件），
 // 便于观测与测试。
 func (s *MemoryStore) PendingCount() int {
 	s.mu.Lock()
@@ -510,7 +606,7 @@ func (s *MemoryStore) PendingCount() int {
 	n := 0
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
+		if me == nil || me.deadLettered {
 			continue
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -571,13 +667,14 @@ func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventH
 		// 不会因空游标而误回到链首。
 		page.NextAfterID = q.AfterID
 	}
+	now := s.now()
 	next := start // 本页之后第一个待检查的审计链位置
 	for i := start; i < len(s.history) && len(page.Events) < limit; i++ {
 		me := s.history[i]
 		if me.event.BusinessKey != q.BusinessKey || me.idempotencyKey != q.IdempotencyKey {
 			continue
 		}
-		page.Events = append(page.Events, toEventRecord(me))
+		page.Events = append(page.Events, s.toEventRecord(me, now))
 		next = i + 1
 	}
 	if len(page.Events) > 0 {
@@ -594,17 +691,34 @@ func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventH
 }
 
 // toEventRecord 把内部事件复制为脱离存储的只读记录；与活动 Outbox 事件
-// 共享同一追加时刻的身份字段，投递元数据取读取当下的最新值。
-func toEventRecord(me *memEvent) EventRecord {
+// 共享同一追加时刻的身份字段，投递元数据取读取当下的最新值。调用时须持锁。
+func (s *MemoryStore) toEventRecord(me *memEvent, now time.Time) EventRecord {
 	return EventRecord{
-		ID:            me.event.ID,
-		Type:          me.event.Type,
-		OccurredAt:    me.event.OccurredAt,
-		Payload:       cloneEventPayload(me.event.Payload),
-		BusinessKey:   me.event.BusinessKey,
-		Deliveries:    me.event.deliveries,
-		LastAttemptAt: me.event.lastAttemptAt,
+		ID:               me.event.ID,
+		Type:             me.event.Type,
+		OccurredAt:       me.event.OccurredAt,
+		Payload:          cloneEventPayload(me.event.Payload),
+		BusinessKey:      me.event.BusinessKey,
+		Deliveries:       me.event.deliveries,
+		LastAttemptAt:    me.event.lastAttemptAt,
+		Status:           s.eventStatus(me, now),
+		DeadLetterReason: me.deadLetterReason,
+		DeadLetteredAt:   me.deadLetteredAt,
 	}
+}
+
+// eventStatus 计算事件当前的投递状态。调用时须持锁。
+func (s *MemoryStore) eventStatus(me *memEvent, now time.Time) string {
+	if me.deadLettered {
+		return EventStatusDeadLettered
+	}
+	if _, ok := s.events[me.event.ID]; !ok {
+		return EventStatusDelivered // 已 Ack：活动副本移除，审计副本保留
+	}
+	if me.claimed || (me.claimID != "" && now.Before(me.claimedUntil)) {
+		return EventStatusClaimed
+	}
+	return EventStatusPending
 }
 
 // cloneEventPayload 复制负载中可变的切片，避免调用方修改记录影响存储内部。

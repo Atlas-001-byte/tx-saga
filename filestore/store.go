@@ -202,8 +202,8 @@ func (s *FileStore) ClaimPendingEvents(ctx context.Context, max int) ([]*txsaga.
 		remaining := d.pending[:0]
 		for _, eid := range d.pending {
 			me := d.events[eid]
-			if me == nil || !me.alive {
-				continue // 已 Ack，丢弃墓碑 ID
+			if me == nil || !me.alive || me.deadLettered {
+				continue // 已 Ack 或已死信，丢弃墓碑 ID
 			}
 			if me.claimID != "" && now.Before(me.claimedUntil) {
 				remaining = append(remaining, eid)
@@ -216,7 +216,9 @@ func (s *FileStore) ClaimPendingEvents(ctx context.Context, max int) ([]*txsaga.
 			me.claimed = true
 			me.claimID = ""
 			me.claimedUntil = time.Time{}
-			me.event = me.event.WithDeliveryMeta(me.event.Deliveries()+1, now)
+			me.event = me.event.
+				WithDeliveryMeta(me.event.Deliveries()+1, now).
+				WithRoundDeliveries(me.event.RoundDeliveries() + 1)
 			cp := me.event
 			out = append(out, &cp)
 		}
@@ -242,7 +244,7 @@ func (s *FileStore) ClaimPendingEventsLeased(ctx context.Context, ttl time.Durat
 		live := d.pending[:0]
 		for _, eid := range d.pending {
 			me := d.events[eid]
-			if me == nil || !me.alive {
+			if me == nil || !me.alive || me.deadLettered {
 				continue
 			}
 			if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -257,7 +259,9 @@ func (s *FileStore) ClaimPendingEventsLeased(ctx context.Context, ttl time.Durat
 			cid := fmt.Sprintf("claim-%020d", d.claimSeq)
 			me.claimID = cid
 			me.claimedUntil = now.Add(ttl)
-			me.event = me.event.WithDeliveryMeta(me.event.Deliveries()+1, now)
+			me.event = me.event.
+				WithDeliveryMeta(me.event.Deliveries()+1, now).
+				WithRoundDeliveries(me.event.RoundDeliveries() + 1)
 			cp := me.event
 			out = append(out, txsaga.ClaimedEvent{
 				Event:        &cp,
@@ -341,8 +345,92 @@ func (s *FileStore) NackLeasedEvent(ctx context.Context, eventID, claimID string
 	})
 }
 
-// PendingCount 返回当前立即可领取的活动事件数（不含有效租约内事件），
-// 与 MemoryStore.PendingCount 的观测口径一致，便于观测与测试。
+// FailEvent 实现 txsaga.DeadLetterStore：退回一次失败投递，本轮领取次数
+// 达到 maxDeliveries 时在同一份快照中转死信并退出普通领取，语义与
+// MemoryStore.FailEvent 一致。
+func (s *FileStore) FailEvent(ctx context.Context, eventID, claimID, reason string, maxDeliveries int) (bool, error) {
+	dead := false
+	err := s.mutate(ctx, func(d *fsData, now time.Time) error {
+		me, ok := d.events[eventID]
+		if !ok || !me.alive {
+			return fmt.Errorf("txsaga: event %q not found", eventID)
+		}
+		if claimID != "" {
+			if me.claimID != claimID {
+				return fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, txsaga.ErrStaleClaim)
+			}
+		} else if !me.claimed {
+			return errNoChange // 与 NackEvent 一致的幂等退回：未在领取中无需处理
+		}
+		if maxDeliveries > 0 && me.event.RoundDeliveries() >= maxDeliveries {
+			// 达到上限：解除领取、隔离为死信并退出待领取队列。
+			me.deadLettered = true
+			me.deadLetterReason = reason
+			me.deadLetteredAt = now
+			me.claimed = false
+			me.claimID = ""
+			me.claimedUntil = time.Time{}
+			remaining := d.pending[:0]
+			for _, eid := range d.pending {
+				if eid != eventID {
+					remaining = append(remaining, eid)
+				}
+			}
+			d.pending = remaining
+			dead = true
+			return nil
+		}
+		if claimID != "" {
+			me.claimID = ""
+			me.claimedUntil = time.Time{}
+		} else {
+			me.claimed = false
+			d.pending = append(d.pending, eventID)
+		}
+		return nil
+	})
+	if errors.Is(err, errNoChange) {
+		return false, nil
+	}
+	return dead, err
+}
+
+// errNoChange 标记“按幂等语义无需任何修改”的回调出口：不触发落盘。
+var errNoChange = errors.New("filestore: no change")
+
+// RequeueDeadLetter 实现 txsaga.DeadLetterStore：仅死信事件可重新入队，
+// 与领取、Ack、Nack 在同一临界区内原子互斥，语义与 MemoryStore 一致。
+func (s *FileStore) RequeueDeadLetter(ctx context.Context, eventID string) error {
+	return s.mutate(ctx, func(d *fsData, _ time.Time) error {
+		me, ok := d.events[eventID]
+		if !ok {
+			return fmt.Errorf("txsaga: event %q: %w", eventID, txsaga.ErrEventNotFound)
+		}
+		if !me.alive || !me.deadLettered {
+			// 已投递（Ack）、待投递或领取中：都不是死信。
+			return fmt.Errorf("txsaga: event %q: %w", eventID, txsaga.ErrEventNotDeadLettered)
+		}
+		// 清除领取锁并回到待投递：本轮次数从零重新计数，累计 Deliveries、
+		// 最近领取时间与死信历史信息保留。不追加新事件，审计链顺序不变。
+		me.deadLettered = false
+		me.claimed = false
+		me.claimID = ""
+		me.claimedUntil = time.Time{}
+		me.event = me.event.WithRoundDeliveries(0)
+		// 防御性去重：同一事件在待领取队列中始终只有一份。
+		remaining := d.pending[:0]
+		for _, eid := range d.pending {
+			if eid != eventID {
+				remaining = append(remaining, eid)
+			}
+		}
+		d.pending = append(remaining, eventID)
+		return nil
+	})
+}
+
+// PendingCount 返回当前立即可领取的活动事件数（不含有效租约内与已死信
+// 事件），与 MemoryStore.PendingCount 的观测口径一致，便于观测与测试。
 func (s *FileStore) PendingCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -350,7 +438,7 @@ func (s *FileStore) PendingCount() int {
 	n := 0
 	for _, eid := range s.d.pending {
 		me := s.d.events[eid]
-		if me == nil || !me.alive {
+		if me == nil || !me.alive || me.deadLettered {
 			continue
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {

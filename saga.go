@@ -247,6 +247,10 @@ type Event struct {
 	// 投递元数据，由 Claim/Ack/Nack 维护，不参与业务语义。
 	deliveries    int
 	lastAttemptAt time.Time
+	// roundDeliveries 是当前投递轮次（事件入队或死信重新入队以来）的领取
+	// 次数，仅用于有界投递上限判定：重新入队死信时归零，累计 deliveries
+	// 不回退。未配置投递上限时不影响任何行为。
+	roundDeliveries int
 }
 
 // Deliveries 返回该事件已进入领取/投递流程的次数（含首次）。
@@ -256,6 +260,11 @@ func (e *Event) Deliveries() int { return e.deliveries }
 // LastAttemptAt 返回最近一次领取时间；从未被领取为零值。
 func (e *Event) LastAttemptAt() time.Time { return e.lastAttemptAt }
 
+// RoundDeliveries 返回当前投递轮次（事件入队或死信重新入队以来）的领取
+// 次数。Relay 配置投递上限时据此判定本轮次数是否耗尽；死信重新入队后
+// 从零重新计数，而 Deliveries 的累计值不回退。
+func (e *Event) RoundDeliveries() int { return e.roundDeliveries }
+
 // WithDeliveryMeta 返回事件的一份副本，并写入投递元数据（投递次数与最近
 // 领取时间）。本方法供 Store 的持久化实现使用：从磁盘等外部载体重建事件
 // 时恢复 Deliveries 与 LastAttemptAt，使领取/退回/租约语义在重开存储后
@@ -264,6 +273,14 @@ func (e *Event) LastAttemptAt() time.Time { return e.lastAttemptAt }
 func (e Event) WithDeliveryMeta(deliveries int, lastAttemptAt time.Time) Event {
 	e.deliveries = deliveries
 	e.lastAttemptAt = lastAttemptAt
+	return e
+}
+
+// WithRoundDeliveries 返回事件的一份副本，并写入当前投递轮次的领取次数。
+// 与 WithDeliveryMeta 一样供 Store 的持久化实现从外部载体重建事件时使用，
+// 使有界投递的轮次计数在重开存储后保持连续；业务调用方一般不应使用。
+func (e Event) WithRoundDeliveries(roundDeliveries int) Event {
+	e.roundDeliveries = roundDeliveries
 	return e
 }
 

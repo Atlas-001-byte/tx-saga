@@ -37,6 +37,10 @@ type Relay struct {
 	// leaseTTL > 0 时启用带租约领取：worker 在 Publish/Ack/Nack 前退出，
 	// 事件在租约到期后的下一轮自动恢复；0 表示沿用普通领取的默认行为。
 	leaseTTL time.Duration
+	// maxDeliveries > 0 时启用有界投递：同一轮次内领取次数达到上限的
+	// 事件在失败退回的同一存储操作中转为死信；0 表示不限制，保持
+	// 至少一次重投的既有行为。
+	maxDeliveries int
 	// now 等时间依赖直接使用 time 包标准行为。
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -86,6 +90,26 @@ func WithClaimLease(ttl time.Duration) RelayOption {
 	}
 }
 
+// WithMaxDeliveries 设置单个投递轮次的次数上限，启用有界投递与死信。
+//
+// 仅正数生效；传入 0 或负数不启用上限，Relay 保持至少一次重投的既有
+// 行为。启用后，每次领取仍使 Deliveries 加一，Publisher 返回 nil 照常
+// Ack；返回错误且本轮次数（RoundDeliveries）未达上限时按原语义 Nack
+// 保留，达到上限时在同一存储操作中转为死信并退出普通领取。租约到期
+// 恢复同样受上限约束：本轮次数已用尽的事件不再调用 Publisher，直接
+// 隔离为死信。死信事件只能经 Engine.RequeueDeadLetter 重新入队，重新
+// 入队后开启新一轮有限计数。
+//
+// Store 必须实现 DeadLetterStore，否则 DeliverOnce/Run 返回
+// ErrDeadLetterUnsupported（可 errors.Is）。
+func WithMaxDeliveries(n int) RelayOption {
+	return func(r *Relay) {
+		if n > 0 {
+			r.maxDeliveries = n
+		}
+	}
+}
+
 // NewRelay 创建事件投递器。
 func NewRelay(store Store, publisher Publisher, opts ...RelayOption) *Relay {
 	r := &Relay{
@@ -121,6 +145,9 @@ type RelayResult struct {
 	Delivered int
 	// Failed 发送失败并 Nack 保留的事件数。
 	Failed int
+	// DeadLettered 本轮达到投递上限被转为死信的事件数（含租约恢复时
+	// 已用尽而直接隔离的事件）；未配置 WithMaxDeliveries 时恒为 0。
+	DeadLettered int
 }
 
 // DeliverOnce 执行一轮领取与投递，不阻塞等待。没有事件时立即返回空结果。
@@ -128,19 +155,29 @@ type RelayResult struct {
 //
 // 通过 WithClaimLease 启用租约且 Store 未实现 ClaimLeaseStore 时，
 // 返回包装了 ErrClaimLeaseUnsupported 的错误（可 errors.Is 判定）。
+// 通过 WithMaxDeliveries 启用投递上限且 Store 未实现 DeadLetterStore 时，
+// 返回 ErrDeadLetterUnsupported（可 errors.Is 判定）。
 func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
+	var dls DeadLetterStore
+	if r.maxDeliveries > 0 {
+		var ok bool
+		dls, ok = r.store.(DeadLetterStore)
+		if !ok {
+			return RelayResult{}, ErrDeadLetterUnsupported
+		}
+	}
 	if r.leaseTTL > 0 {
 		leased, ok := r.store.(ClaimLeaseStore)
 		if !ok {
 			return RelayResult{}, ErrClaimLeaseUnsupported
 		}
-		return r.deliverOnceLeased(ctx, leased)
+		return r.deliverOnceLeased(ctx, leased, dls)
 	}
-	return r.deliverOnce(ctx)
+	return r.deliverOnce(ctx, dls)
 }
 
 // deliverOnce 是未启用租约时的默认路径：领取即锁定，失败立即退回。
-func (r *Relay) deliverOnce(ctx context.Context) (RelayResult, error) {
+func (r *Relay) deliverOnce(ctx context.Context, dls DeadLetterStore) (RelayResult, error) {
 	events, err := r.store.ClaimPendingEvents(ctx, r.batch)
 	if err != nil {
 		return RelayResult{}, err
@@ -153,7 +190,28 @@ func (r *Relay) deliverOnce(ctx context.Context) (RelayResult, error) {
 			res.Failed++
 			continue
 		}
+		if dls != nil && ev.RoundDeliveries() > r.maxDeliveries {
+			// 本轮次数已用尽（上次领取后未退回即退出）：不再调用
+			// Publisher，直接在同一存储操作中隔离为死信。
+			if _, err := dls.FailEvent(ctx, ev.ID, "", "txsaga: delivery attempts exhausted", r.maxDeliveries); err != nil {
+				return res, err
+			}
+			res.DeadLettered++
+			continue
+		}
 		if err := r.publisher.Publish(ctx, *ev); err != nil {
+			if dls != nil {
+				dead, failErr := dls.FailEvent(ctx, ev.ID, "", err.Error(), r.maxDeliveries)
+				if failErr != nil {
+					return res, failErr
+				}
+				if dead {
+					res.DeadLettered++
+				} else {
+					res.Failed++
+				}
+				continue
+			}
 			if nackErr := r.store.NackEvent(ctx, ev.ID); nackErr != nil {
 				return res, nackErr
 			}
@@ -177,10 +235,14 @@ func (r *Relay) deliverOnce(ctx context.Context) (RelayResult, error) {
 //     Nack，不因 ctx 取消改变结论；
 //   - worker 在任何一步退出（未 Nack）：租约到期后事件自动恢复重投。
 //
+// 配置投递上限（dls 非 nil）时：Publish 失败按当前 ClaimID 走 FailEvent，
+// 未达上限退回、达到上限在同一存储操作中转死信；租约恢复时发现本轮次数
+// 已用尽的事件不再调用 Publisher，直接隔离为死信。
+//
 // Ack/Nack 使用独立上下文，避免调用方 ctx 已取消导致确认/退回被 Store
 // 拒绝而被迫等待租约到期。旧 ClaimID（租约已到期、事件被他人重新领取）
 // 返回 ErrStaleClaim 时不作任何操作：当前事件与新租约由接管方负责。
-func (r *Relay) deliverOnceLeased(ctx context.Context, store ClaimLeaseStore) (RelayResult, error) {
+func (r *Relay) deliverOnceLeased(ctx context.Context, store ClaimLeaseStore, dls DeadLetterStore) (RelayResult, error) {
 	claims, err := store.ClaimPendingEventsLeased(ctx, r.leaseTTL, r.batch)
 	if err != nil {
 		return RelayResult{}, err
@@ -195,8 +257,33 @@ func (r *Relay) deliverOnceLeased(ctx context.Context, store ClaimLeaseStore) (R
 			res.Failed++
 			continue
 		}
+		if dls != nil && c.Event.RoundDeliveries() > r.maxDeliveries {
+			// 租约恢复时本轮次数已用尽：不再调用 Publisher，直接隔离。
+			dead, failErr := dls.FailEvent(context.Background(), c.Event.ID, c.ClaimID,
+				"txsaga: delivery attempts exhausted", r.maxDeliveries)
+			if failErr != nil && !errors.Is(failErr, ErrStaleClaim) {
+				return res, failErr
+			}
+			if failErr == nil && dead {
+				res.DeadLettered++
+			}
+			continue
+		}
 		pubErr := r.publisher.Publish(ctx, *c.Event)
 		if pubErr != nil {
+			if dls != nil {
+				dead, failErr := dls.FailEvent(context.Background(), c.Event.ID, c.ClaimID,
+					pubErr.Error(), r.maxDeliveries)
+				if failErr != nil && !errors.Is(failErr, ErrStaleClaim) {
+					return res, failErr
+				}
+				if failErr == nil && dead {
+					res.DeadLettered++
+				} else {
+					res.Failed++
+				}
+				continue
+			}
 			if nackErr := store.NackLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); nackErr != nil &&
 				!errors.Is(nackErr, ErrStaleClaim) {
 				return res, nackErr

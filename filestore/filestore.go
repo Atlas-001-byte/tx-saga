@@ -77,6 +77,14 @@ type fsEvent struct {
 	// alive 为 false 表示事件已被 Ack：不再参与领取，但审计链继续保留。
 	// 这与内存实现“从活动 map 删除、历史链保留指针”等价。
 	alive bool
+
+	// 死信状态。deadLettered 为 true 表示事件已达投递上限被隔离：退出
+	// 普通领取，只能经 RequeueDeadLetter 重新入队。deadLetterReason 与
+	// deadLetteredAt 记录最近一次进入死信的原因与时刻，重新入队后作为
+	// 历史失败信息保留，不回退。
+	deadLettered     bool
+	deadLetterReason string
+	deadLetteredAt   time.Time
 }
 
 // fsData 是整库内存态的不可变替换根：每次变更都在其深拷贝上进行，
@@ -102,7 +110,7 @@ func newData() *fsData {
 }
 
 // FileStore 是建立在本地目录上的 txsaga.Store 实现，同时实现
-// txsaga.ClaimLeaseStore 与 txsaga.EventHistoryStore。
+// txsaga.ClaimLeaseStore、txsaga.EventHistoryStore 与 txsaga.DeadLetterStore。
 //
 // 零值不可用，请使用 Open 构造；用完必须调用 Close 释放目录占用。
 type FileStore struct {
@@ -117,11 +125,12 @@ type FileStore struct {
 	now func() time.Time
 }
 
-// 编译期断言：FileStore 满足全部三个 Store 契约。
+// 编译期断言：FileStore 满足全部四个 Store 契约。
 var (
 	_ txsaga.Store             = (*FileStore)(nil)
 	_ txsaga.ClaimLeaseStore   = (*FileStore)(nil)
 	_ txsaga.EventHistoryStore = (*FileStore)(nil)
+	_ txsaga.DeadLetterStore   = (*FileStore)(nil)
 )
 
 // openRegistry 记录本进程内被存活 FileStore 占用的目录（规范路径 -> 实例）。
@@ -319,10 +328,17 @@ type persistEvent struct {
 
 	Deliveries    int       `json:"deliveries"`
 	LastAttemptAt time.Time `json:"last_attempt_at,omitempty"`
-	Claimed       bool      `json:"claimed"`
-	ClaimID       string    `json:"claim_id,omitempty"`
-	ClaimedUntil  time.Time `json:"claimed_until,omitempty"`
-	Acked         bool      `json:"acked"`
+	// RoundDeliveries 当前投递轮次的领取次数，用于有界投递上限判定，
+	// 重新入队死信时归零；累计 Deliveries 不回退。
+	RoundDeliveries int       `json:"round_deliveries,omitempty"`
+	Claimed         bool      `json:"claimed"`
+	ClaimID         string    `json:"claim_id,omitempty"`
+	ClaimedUntil    time.Time `json:"claimed_until,omitempty"`
+	Acked           bool      `json:"acked"`
+
+	DeadLettered     bool      `json:"dead_lettered,omitempty"`
+	DeadLetterReason string    `json:"dead_letter_reason,omitempty"`
+	DeadLetteredAt   time.Time `json:"dead_lettered_at,omitempty"`
 }
 
 type persistSnapshot struct {
@@ -386,25 +402,30 @@ func encodeSnapshot(d *fsData) ([]byte, error) {
 			return nil, err
 		}
 		out.Events = append(out.Events, persistEvent{
-			ID:             me.event.ID,
-			BusinessKey:    me.event.BusinessKey,
-			Type:           me.event.Type,
-			OccurredAt:     me.event.OccurredAt,
-			Payload:        rawPayload,
-			IdempotencyKey: me.idempotencyKey,
-			Deliveries:     me.event.Deliveries(),
-			LastAttemptAt:  me.event.LastAttemptAt(),
-			Claimed:        me.claimed,
-			ClaimID:        me.claimID,
-			ClaimedUntil:   me.claimedUntil,
-			Acked:          !me.alive,
+			ID:              me.event.ID,
+			BusinessKey:     me.event.BusinessKey,
+			Type:            me.event.Type,
+			OccurredAt:      me.event.OccurredAt,
+			Payload:         rawPayload,
+			IdempotencyKey:  me.idempotencyKey,
+			Deliveries:      me.event.Deliveries(),
+			LastAttemptAt:   me.event.LastAttemptAt(),
+			RoundDeliveries: me.event.RoundDeliveries(),
+			Claimed:         me.claimed,
+			ClaimID:         me.claimID,
+			ClaimedUntil:    me.claimedUntil,
+			Acked:           !me.alive,
+
+			DeadLettered:     me.deadLettered,
+			DeadLetterReason: me.deadLetterReason,
+			DeadLetteredAt:   me.deadLetteredAt,
 		})
 	}
-	// 落盘时压缩墓碑：已 Ack 的事件保留在审计链，但不在待领取队列中。
+	// 落盘时压缩墓碑：已 Ack 或已死信的事件保留在审计链，但不在待领取队列中。
 	seenPending := make(map[string]struct{}, len(d.pending))
 	for _, id := range d.pending {
 		me := d.events[id]
-		if me == nil || !me.alive {
+		if me == nil || !me.alive || me.deadLettered {
 			continue
 		}
 		if _, dup := seenPending[id]; dup {

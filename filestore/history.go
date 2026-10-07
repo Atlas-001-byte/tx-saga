@@ -2,6 +2,7 @@ package filestore
 
 import (
 	"context"
+	"time"
 
 	"github.com/txsaga/txsaga"
 )
@@ -59,13 +60,14 @@ func (s *FileStore) ListEvents(ctx context.Context, q txsaga.EventHistoryQuery) 
 		// 空页（游标已是最后一条）时回传入参游标，重复查询保持幂等。
 		page.NextAfterID = q.AfterID
 	}
+	now := s.now()
 	next := start
 	for i := start; i < len(s.d.history) && len(page.Events) < limit; i++ {
 		me := s.d.history[i]
 		if me.event.BusinessKey != q.BusinessKey || me.idempotencyKey != q.IdempotencyKey {
 			continue
 		}
-		page.Events = append(page.Events, toEventRecord(me))
+		page.Events = append(page.Events, toEventRecord(me, now))
 		next = i + 1
 	}
 	if len(page.Events) > 0 {
@@ -83,18 +85,36 @@ func (s *FileStore) ListEvents(ctx context.Context, q txsaga.EventHistoryQuery) 
 
 // toEventRecord 把内部事件复制为脱离存储的只读记录；投递元数据取读取当下
 // 的最新值，已 Ack 事件同样可读出（计数与最近领取时间为其最后一次值）。
-func toEventRecord(me *fsEvent) txsaga.EventRecord {
+func toEventRecord(me *fsEvent, now time.Time) txsaga.EventRecord {
 	ep, _ := me.event.Payload.(txsaga.EventPayload)
 	if ep.SucceededSteps != nil {
 		ep.SucceededSteps = append([]string(nil), ep.SucceededSteps...)
 	}
 	return txsaga.EventRecord{
-		ID:            me.event.ID,
-		Type:          me.event.Type,
-		OccurredAt:    me.event.OccurredAt,
-		Payload:       ep,
-		BusinessKey:   me.event.BusinessKey,
-		Deliveries:    me.event.Deliveries(),
-		LastAttemptAt: me.event.LastAttemptAt(),
+		ID:               me.event.ID,
+		Type:             me.event.Type,
+		OccurredAt:       me.event.OccurredAt,
+		Payload:          ep,
+		BusinessKey:      me.event.BusinessKey,
+		Deliveries:       me.event.Deliveries(),
+		LastAttemptAt:    me.event.LastAttemptAt(),
+		Status:           eventStatus(me, now),
+		DeadLetterReason: me.deadLetterReason,
+		DeadLetteredAt:   me.deadLetteredAt,
 	}
+}
+
+// eventStatus 计算事件当前的投递状态，与 MemoryStore 的口径一致。
+// 调用时须持锁。
+func eventStatus(me *fsEvent, now time.Time) string {
+	if me.deadLettered {
+		return txsaga.EventStatusDeadLettered
+	}
+	if !me.alive {
+		return txsaga.EventStatusDelivered // 已 Ack：审计副本保留
+	}
+	if me.claimed || (me.claimID != "" && now.Before(me.claimedUntil)) {
+		return txsaga.EventStatusClaimed
+	}
+	return txsaga.EventStatusPending
 }

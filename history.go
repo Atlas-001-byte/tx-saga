@@ -61,6 +61,14 @@ type EventRecord struct {
 	Deliveries int
 	// LastAttemptAt 最近一次领取时间；从未被领取为零值。
 	LastAttemptAt time.Time
+	// Status 事件当前的投递状态，取值为 EventStatus* 常量：
+	// 待投递、领取中、已投递（Ack）或死信。
+	Status string
+	// DeadLetterReason 最近一次进入死信的失败原因；从未进入死信为空。
+	// 死信重新入队后作为历史失败信息保留，不回退。
+	DeadLetterReason string
+	// DeadLetteredAt 最近一次进入死信的时间；从未进入死信为零值。
+	DeadLetteredAt time.Time
 }
 
 // EventHistoryPage 是一页按追加顺序排列的执行事件。

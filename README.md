@@ -66,10 +66,11 @@
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
 | `EventHistoryStore` | 可选的只读历史接口：`ListEvents` 按执行身份分页回看事件链 |
 | `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
+| `DeadLetterStore` | 可选的死信接口：有界投递上限、失败退回与转死信同一存储操作、死信重新入队 |
 | `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
-| `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore` |
-| `filestore.FileStore` | 子包 `filestore` 的本地目录持久化实现：`filestore.Open(dir)` 打开/初始化、`Close()` 释放占用；快照原子落盘，重开目录可续跑、查终态、读历史；同样实现三个 Store 契约 |
-| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 查询事件历史 |
+| `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore`、`EventHistoryStore` 与 `DeadLetterStore` |
+| `filestore.FileStore` | 子包 `filestore` 的本地目录持久化实现：`filestore.Open(dir)` 打开/初始化、`Close()` 释放占用；快照原子落盘，重开目录可续跑、查终态、读历史；同样实现四个 Store 契约 |
+| `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 查询事件历史，`RequeueDeadLetter` 重新入队死信事件 |
 | `EventHistoryQuery` / `EventRecord` / `EventHistoryPage` | 历史查询输入（Saga 名称、业务键、幂等键、`AfterID`、`Limit`）、单条事件记录与分页结果 |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
 
@@ -85,7 +86,10 @@
 - `ErrClaimLeaseUnsupported`：`WithClaimLease` 启用了租约，但 Store 未实现 `ClaimLeaseStore`；
 - `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动；
 - `ErrEventHistoryUnsupported`：Store 未实现 `EventHistoryStore`，不支持事件历史查询；
-- `ErrEventCursorNotFound`：历史查询的 `AfterID` 不存在，或不属于给定执行身份；出错时不返回部分页。
+- `ErrEventCursorNotFound`：历史查询的 `AfterID` 不存在，或不属于给定执行身份；出错时不返回部分页；
+- `ErrDeadLetterUnsupported`：`WithMaxDeliveries` 启用了投递上限（或请求重新入队死信），但 Store 未实现 `DeadLetterStore`；
+- `ErrEventNotFound`：重新入队时给定的事件 ID 不存在；
+- `ErrEventNotDeadLettered`：重新入队时事件不在死信状态（尚可投递、领取中或已投递）。
 
 `filestore` 子包另有自己的哨兵错误（以 `errors.Is` 判定，错误链保留）：
 
@@ -109,7 +113,8 @@ page, err := engine.ListEvents(ctx, txsaga.EventHistoryQuery{
     Limit:          50, // 非正数按 100
 })
 // page.Events []txsaga.EventRecord：ID、Type、OccurredAt、Payload、
-// BusinessKey、Deliveries、LastAttemptAt
+// BusinessKey、Deliveries、LastAttemptAt、Status（pending/claimed/
+// delivered/dead_lettered）、DeadLetterReason、DeadLetteredAt
 ```
 
 ## 最小用法
@@ -298,6 +303,19 @@ Ack 或 Nack 前退出时，事件于租约到期后的下一次 `DeliverOnce`/`
 `ClaimID` 立即 Nack；`Publish` 进行中取消则按其返回结果处理。Store 需
 实现 `ClaimLeaseStore`（`MemoryStore` 已实现），否则返回
 `ErrClaimLeaseUnsupported`。
+
+传入 `WithMaxDeliveries(n)`（仅正数生效）可启用有界投递与死信：每次领取
+仍使 `Deliveries` 加一，`Publish` 返回 nil 照常 Ack；返回错误且本轮次数
+（`Event.RoundDeliveries`）未达上限时按原语义 Nack 保留，达到上限时在
+同一存储操作中转死信并退出普通领取。租约到期恢复同样受上限约束：本轮
+次数已用尽的事件不再调用 `Publish`，直接隔离为死信。死信保留事件 ID、
+类型、发生时间、负载、累计 `Deliveries`、最近领取时间、失败原因与进入
+死信时间（经 `EventRecord` 可审计，`filestore` 重开后一致）。死信事件可
+经 `engine.RequeueDeadLetter(ctx, eventID)` 重新入队：清除领取锁、开启
+新一轮有限计数，累计 `Deliveries` 与历史失败信息不回退，再次耗尽仍进
+死信；重复调用返回 `ErrEventNotDeadLettered`，不追加事件、不改变顺序。
+Store 需实现 `DeadLetterStore`（`MemoryStore` 与 `filestore.FileStore`
+已实现），否则 `DeliverOnce`/`Run` 返回 `ErrDeadLetterUnsupported`。
 
 ## 示例
 
