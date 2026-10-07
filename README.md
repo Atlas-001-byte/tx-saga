@@ -23,6 +23,11 @@
   与每次失败后的等待时长（`ActionRetry` / `CompensateRetry`）。未配置时
   仍是一步一次调用、失败即转补偿。重试期间的中间失败不提交状态、不追加
   事件；等待与动作都响应 `context`。
+- **永久失败（可判定）**：正向或补偿动作用 `Permanent(err)` 包装返回的错误
+  表示业务上已明确不可能成功：即使重试预算尚有剩余也只按实际调用次数计、
+  立即结束重试阶段且不再等待，提交口径与预算耗尽一致。`IsPermanent(err)`
+  沿错误链判定，`errors.Is` 与 `Unwrap` 语义保留，`Permanent(nil)` 为 nil。
+  context 取消仍优先于永久失败。
 - **补偿**：正向动作在重试预算内成功则继续推进；预算耗尽仍失败才停止推进
   （依赖图模式下同时停止调度未启动步骤，已启动的兄弟动作跑完并照常提交），
   仅按确认成功顺序的相反方向补偿已确认成功的步骤；未执行到或未确认的
@@ -47,6 +52,7 @@
 | --- | --- |
 | `Definition` / `Step` | Saga 定义：名称、版本、步骤列表；每步提供幂等 `Action`，可选 `Compensate`、可选 `DependsOn` 前置步骤（依赖图模式），并可分别为动作与补偿配置可选 `RetryPolicy` |
 | `RetryPolicy` | 单个动作的有限重试预算：`MaxAttempts` 最大总调用次数（含首次）、`RetryWait` 每次失败后的等待时长；零值按 1 次、0 等待处理 |
+| `Permanent(err)` / `IsPermanent(err)` | 永久错误包装与判定：动作返回 `Permanent(err)` 立即结束重试（即使预算尚有剩余），提交口径与预算耗尽一致；保留 `errors.Is`/`Unwrap`，nil 输入返回 nil |
 | `ExecutionRequest` | 执行请求：业务键、外部幂等键、透传负载 |
 | `Result` / `StepOutcome` | 确定状态、失败原因、业务键、各步处理结果与调用次数 |
 | `Store` | 状态存储接口：原子提交状态变更与事件、领取/Ack/Nack 事件 |
@@ -187,6 +193,38 @@ step := txsaga.Step{
   返回该 context 的错误；动作以 context 错误结束且外层 context 已取消时
   同样返回该取消错误。两种情况下都不确认当前动作、不启动补偿，也不改变
   已经提交的执行状态；以新 context 用同一执行身份再次调用即可继续。
+
+### 永久失败
+
+业务动作已明确不可能成功（如参数非法、账户被冻结、前置约束永久不满足）
+时，重试只会浪费预算，可返回 `Permanent(err)` 标记：
+
+```go
+func charge(ctx context.Context, exec txsaga.ExecutionView) error {
+    acc, err := loadAccount(exec.BusinessKey())
+    if err != nil {
+        return err // 普通错误：仍按 ActionRetry 预算重试
+    }
+    if acc.Closed {
+        return txsaga.Permanent(errAccountClosed) // 永久失败：立即结束重试
+    }
+    // ...
+}
+```
+
+- 正向动作返回永久失败时，即使 `MaxAttempts` 尚有剩余也只调用一次、不再
+  等待；该步按预算耗尽的同一口径提交失败：`Attempts` 只记实际调用次数，
+  `Error` 与执行级 `FailureReason` 保留底层错误文本，随后停止调度未启动
+  步骤，已启动的依赖图兄弟动作照常返回并提交，只按已确认成功顺序逆序补偿。
+- 补偿动作返回永久失败时同样立即结束补偿重试：第一次调用即把该步记为
+  `compensation_failed` 并把执行固定为 `compensation_failed` 终态；
+  后续同身份调用直接返回既有终态。
+- 永久失败不产生中间失败事件，最终事件序列与预算耗尽失败完全一致。
+- `Permanent` 保留错误链：`errors.Is(permanentErr, target)` 与
+  `errors.Unwrap` 行为不变，外层再包一层（如 `fmt.Errorf("…: %w", …)`）
+  后 `IsPermanent` 仍可判定；`Permanent(nil)` 返回 nil。
+- context 在动作执行或等待期间取消仍**优先于**永久失败：不确认当前动作、
+  不启动补偿，返回 context 错误且已提交状态不变，同身份重入可继续。
 
 Outbox 投递由调用方提供 `Publisher`：
 

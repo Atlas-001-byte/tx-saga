@@ -79,7 +79,9 @@ var (
 //
 // 动作必须遵守幂等契约：同一步骤在进程崩溃、调用超时后可能被再次调用，
 // 重复调用不得产生重复的业务效果。动作返回 nil 即视为该步骤确认成功，
-// 之后引擎先提交成功状态，再执行下一步。
+// 之后引擎先提交成功状态，再执行下一步。返回由 Permanent 包装的错误
+// 表示永久失败：重试立即结束，按预算耗尽的失败口径提交；普通错误按
+// ActionRetry 预算重试。
 type ActionFunc func(ctx context.Context, exec ExecutionView) error
 
 // CompensationFunc 是已确认成功步骤的补偿幂等动作。
@@ -87,6 +89,9 @@ type ActionFunc func(ctx context.Context, exec ExecutionView) error
 // 补偿按步骤成功顺序的相反方向逐个执行。补偿同样可能被重复调用，
 // 实现必须自身幂等。返回 nil 表示补偿确认成功；返回错误时执行固定在
 // compensation_failed 终态，未确认的补偿允许在后续调用中重试（终态结果不变）。
+// 返回由 Permanent 包装的永久失败时立即结束补偿重试：即使 CompensateRetry
+// 预算尚有剩余也只调用一次、不再等待，第一次确认失败即把该步记为
+// compensation_failed 并把执行固定为 compensation_failed 终态。
 type CompensationFunc func(ctx context.Context, exec ExecutionView) error
 
 // RetryPolicy 配置一个动作的有限重试预算。
@@ -95,6 +100,10 @@ type CompensationFunc func(ctx context.Context, exec ExecutionView) error
 // 每次动作返回非 nil 错误且仍有剩余次数时，引擎等待 RetryWait 后再次调用
 // 同一动作；等待与动作本身都响应传入的 context。MaxAttempts 是包含首次
 // 调用在内的最大总调用次数；负数次数或负等待时长属于非法定义。
+//
+// 动作返回由 Permanent 包装的永久失败时重试立即结束：即使 MaxAttempts
+// 尚有剩余也只按实际调用次数计、不再等待，按与预算耗尽相同的口径提交该步
+// 失败。普通错误仍按上述预算重试。
 type RetryPolicy struct {
 	// MaxAttempts 最大总调用次数（含首次）。零值按 1 处理；负数为非法定义。
 	MaxAttempts int

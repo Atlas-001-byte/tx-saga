@@ -152,8 +152,10 @@ func (v execView) SucceededSteps() []string {
 // 每一步确认后，状态与对应 Outbox 事件在同一个 Store 事务中原子提交，
 // 然后才调度后续步骤。正向动作在其 ActionRetry 预算内的失败会在指定等待后
 // 重试同一动作，中间失败不提交状态、不追加事件；预算耗尽仍失败才停止推进。
-// 补偿动作同样可配置 CompensateRetry 预算，预算耗尽仍报错则固定为
-// compensation_failed 终态。重试等待与动作本身都响应 ctx：ctx 取消时
+// 动作返回 Permanent 包装的永久失败时即使预算尚有剩余也只调用一次、不再
+// 等待，按预算耗尽的同一口径提交失败。补偿动作同样可配置 CompensateRetry
+// 预算，预算耗尽仍报错或返回永久失败则固定为 compensation_failed 终态。
+// 重试等待与动作本身都响应 ctx：ctx 取消时（即使动作刚返回永久失败）
 // Execute 返回 ctx 的错误，不确认当前动作、不调度新的兄弟步骤、不启动补偿，
 // 也不改变已经提交的执行状态。
 func (e *Engine) Execute(ctx context.Context, def Definition, req ExecutionRequest) (Result, error) {
@@ -469,10 +471,14 @@ func (e *Engine) commitStepResult(ctx context.Context, def Definition, req Execu
 // runWithRetry 在重试预算内反复调用同一动作。
 //
 // 返回 actionErr 为 nil 表示预算内成功（调用次数计入 attempts）；
-// actionErr 非 nil、err 为 nil 表示预算耗尽仍失败，actionErr 为最近一次错误；
+// actionErr 非 nil、err 为 nil 表示预算耗尽仍失败（或失败被 Permanent
+// 标记为永久失败），actionErr 为最近一次错误；
 // err 非 nil 表示外层 context 已取消——可能发生在调用前、失败后的等待期间，
 // 也可能动作刚返回（无论它返回 nil 还是错误），只要外层 context 已取消就
 // 按取消处理：不确认动作，由调用方原样返回 ctx 错误。
+//
+// 永久失败优先于重试预算：动作返回 Permanent 包装的错误时，即使仍有剩余
+// 次数也立即结束本阶段、不再等待，但 context 取消仍优先于永久失败。
 func (e *Engine) runWithRetry(ctx context.Context, policy RetryPolicy, call func() error) (actionErr error, attempts int, err error) {
 	budget := normalizeRetry(policy)
 	for {
@@ -482,12 +488,18 @@ func (e *Engine) runWithRetry(ctx context.Context, policy RetryPolicy, call func
 		attempts++
 		actionErr = call()
 		// 与基线一致：动作返回后先看外层 context，已取消则即使动作报告成功
-		// 也不确认该动作——结果可能已在下游生效，由同身份重入依赖动作幂等收敛。
+		// 或永久失败也不确认该动作——结果可能已在下游生效，由同身份重入依赖
+		// 动作幂等收敛。
 		if err := ctx.Err(); err != nil {
 			return nil, attempts, err
 		}
 		if actionErr == nil {
 			return nil, attempts, nil
+		}
+		// 永久失败：业务上已明确不可能成功，即使预算尚有剩余也不再等待、
+		// 不再调用，按与预算耗尽相同的口径交由调用方提交。
+		if IsPermanent(actionErr) {
+			return actionErr, attempts, nil
 		}
 		if attempts >= budget.maxAttempts {
 			return actionErr, attempts, nil
