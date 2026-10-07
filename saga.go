@@ -256,6 +256,17 @@ func (e *Event) Deliveries() int { return e.deliveries }
 // LastAttemptAt 返回最近一次领取时间；从未被领取为零值。
 func (e *Event) LastAttemptAt() time.Time { return e.lastAttemptAt }
 
+// WithDeliveryMeta 返回事件的一份副本，并写入投递元数据（投递次数与最近
+// 领取时间）。本方法供 Store 的持久化实现使用：从磁盘等外部载体重建事件
+// 时恢复 Deliveries 与 LastAttemptAt，使领取/退回/租约语义在重开存储后
+// 保持连续。事件的身份字段（ID、类型、发生时间、负载等）保持不变。
+// 内存实现直接维护活动对象，无需经过本方法；业务调用方一般不应使用。
+func (e Event) WithDeliveryMeta(deliveries int, lastAttemptAt time.Time) Event {
+	e.deliveries = deliveries
+	e.lastAttemptAt = lastAttemptAt
+	return e
+}
+
 // EventPayload 是事件的结构化负载。
 type EventPayload struct {
 	SagaName       string `json:"saga_name"`

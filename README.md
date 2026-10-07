@@ -46,6 +46,14 @@
 本包不规定磁盘文件格式：持久化由 `Store` 接口承载，仓库提供进程内
 `MemoryStore`，调用方可另行实现基于数据库事务的存储。
 
+仓库另在 `filestore` 子包提供只依赖标准库的本地目录持久化实现
+`filestore.FileStore`：一次 `Commit` 的状态变更与事件整体写入目录下的
+单个 JSON 快照（临时文件 + fsync + 原子改名），写入成功后即使进程退出，
+重新 `Open` 同一目录仍可继续执行、查询终态并读取完整事件历史。
+`FileStore` 同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore`，
+可直接交给 `NewEngine` 与 `NewRelay` 使用；它支持同进程多 goroutine
+共享一个实例，但不支持多进程（或同进程多实例）同时写同一目录。
+
 ## 公开入口
 
 | 类型/函数 | 说明 |
@@ -60,6 +68,7 @@
 | `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
 | `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
 | `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore` |
+| `filestore.FileStore` | 子包 `filestore` 的本地目录持久化实现：`filestore.Open(dir)` 打开/初始化、`Close()` 释放占用；快照原子落盘，重开目录可续跑、查终态、读历史；同样实现三个 Store 契约 |
 | `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 查询事件历史 |
 | `EventHistoryQuery` / `EventRecord` / `EventHistoryPage` | 历史查询输入（Saga 名称、业务键、幂等键、`AfterID`、`Limit`）、单条事件记录与分页结果 |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
@@ -77,6 +86,13 @@
 - `ErrStaleClaim`：Ack/Nack 携带的 `ClaimID` 已失效（租约到期后被重新领取），当前事件与新租约不会被改动；
 - `ErrEventHistoryUnsupported`：Store 未实现 `EventHistoryStore`，不支持事件历史查询；
 - `ErrEventCursorNotFound`：历史查询的 `AfterID` 不存在，或不属于给定执行身份；出错时不返回部分页。
+
+`filestore` 子包另有自己的哨兵错误（以 `errors.Is` 判定，错误链保留）：
+
+- `filestore.ErrStoreOpen`：目录不可创建、不是目录或不可读写；
+- `filestore.ErrStoreLocked`：同一进程已有另一个 `FileStore` 占用该目录；
+- `filestore.ErrCorruptStore`：既有快照损坏、截断或无法组成一致快照；此时不会覆盖原数据文件；
+- `filestore.ErrUnsupportedPayload`：`Payload` 或事件负载无法被 `encoding/json` 稳定表示（如 chan、func、循环引用、NaN）；本次提交整体丢弃，不留半次提交。
 
 事件历史按执行身份只读查询，`AfterID` 为空从头开始，`Limit<=0` 按 100 条
 返回，页内按事件发生及追加顺序排列，以 `NextAfterID`/`HasMore` 续页。
@@ -115,6 +131,44 @@ result, err := engine.Execute(ctx, def, txsaga.ExecutionRequest{
     IdempotencyKey: "request-7a3f", // 外部幂等键
 })
 ```
+
+## 本地目录持久化（filestore 子包）
+
+`filestore.FileStore` 把执行状态、定义绑定与 Outbox 事件（含已 Ack 事件的
+审计副本）保存在给定目录下的单个 JSON 快照中。每次 `Commit` 或投递元数据
+变更都在同一临界区内生成整库新快照，经“临时文件写入 → fsync → 原子改名
+替换”落盘：一次提交中的状态修改与事件追加要么整体可见、要么整体不可见，
+中断写入不会只留下状态或只留下事件。
+
+```go
+import "github.com/txsaga/txsaga/filestore"
+
+store, err := filestore.Open("./data/saga") // 目录不存在会自动创建
+if err != nil {
+    // errors.Is(err, filestore.ErrStoreOpen)     目录不可创建/不可读写
+    // errors.Is(err, filestore.ErrStoreLocked)   同进程已有实例占用该目录
+    // errors.Is(err, filestore.ErrCorruptStore)  既有快照损坏且未被覆盖
+    return err
+}
+defer store.Close()
+
+engine := txsaga.NewEngine(store) // 与 MemoryStore 完全相同的用法
+relay  := txsaga.NewRelay(store, publisher, txsaga.WithClaimLease(time.Minute))
+```
+
+写入成功返回后即使进程退出，重新 `filestore.Open` 同一目录即可：继续执行
+未完成的执行（同身份幂等、补偿逆序等语义不变）、用 `GetResult` 查询终态、
+用 `ListEvents` 读取完整事件历史；租约领取状态、投递计数与最近领取时间
+也随快照保留，到期事件在重开后仍可重新领取。
+
+- 支持同一进程内多个 goroutine 共享一个 `FileStore`；不支持多进程或同进程
+  多个 `FileStore` 同时写同一目录（构造返回 `filestore.ErrStoreLocked`）。
+- `Payload` 与事件负载需能被 `encoding/json` 稳定表示；无法表示时该次
+  `Commit` 返回 `filestore.ErrUnsupportedPayload` 且不留半次提交。
+  内存中动作仍收到本次 `Execute` 传入的原始 `Payload`（不经过 JSON 转换），
+  仅重开目录后按 JSON 语义读回。
+- `context` 取消时读写原样返回该 context 错误，已提交数据不受影响。
+- 只依赖 Go 标准库；`MemoryStore` 与 `Engine` 的既有行为保持不变。
 
 ## 依赖图并发（可选）
 
