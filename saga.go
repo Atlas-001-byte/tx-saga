@@ -65,7 +65,8 @@ const (
 // 哨兵错误，调用方可用 errors.Is 判定。
 var (
 	// ErrInvalidDefinition 定义非法（名称为空、步骤为空、步骤名为空、
-	// 缺少正向动作、前置步骤未知/自依赖/重复/成环）或执行请求缺少外部幂等键。
+	// 缺少正向动作、前置步骤未知/自依赖/重复/成环、MaxConcurrency 为负）
+	// 或执行请求缺少外部幂等键。
 	ErrInvalidDefinition = errors.New("txsaga: invalid saga definition")
 	// ErrExecutionNotFound 未知执行身份：该业务键下不存在由给定 Saga 定义
 	// 与外部幂等键标识的执行。
@@ -159,6 +160,14 @@ type Definition struct {
 	// 按声明顺序逐个执行；任一步骤声明前置后进入依赖图模式，按前置关系调度，
 	// 无前置的步骤并发执行。Result.Steps 始终按本切片声明顺序返回。
 	Steps []Step
+	// MaxConcurrency 依赖图模式下正向阶段的可选并发上限：一次 Execute 推进
+	// 正向阶段时，最多允许该数量的步骤处于已启动但尚未确认提交的状态
+	// （ActionRetry 两次调用之间的等待时间同样占用额度）。零值表示不限：
+	// 所有就绪步骤同时启动；正数表示额度占满后其余就绪步骤保持 pending，
+	// 任一步骤确认提交释放额度后，按 Steps 声明顺序选择最早出现的就绪步骤
+	// 启动。大于实际步骤数时按实际步骤数执行；负数为非法定义。
+	// 顺序模式（所有步骤均未声明前置）始终一次只执行一个步骤，不受本配置影响。
+	MaxConcurrency int
 }
 
 // ExecutionRequest 发起一次 Saga 执行。

@@ -13,8 +13,12 @@ import (
 // 未配置的重试预算按最大 1 次、等待 0 处理。
 // 步骤声明的前置（DependsOn）必须指向定义内已存在的其它步骤：前置名称未知、
 // 自依赖、同一前置重复声明或前置关系成环均属非法定义。
+// MaxConcurrency 为负数同样非法。
 func ValidateDefinition(d Definition) error {
 	if strings.TrimSpace(d.Name) == "" {
+		return ErrInvalidDefinition
+	}
+	if d.MaxConcurrency < 0 {
 		return ErrInvalidDefinition
 	}
 	if len(d.Steps) == 0 {
@@ -145,7 +149,8 @@ func (v execView) SucceededSteps() []string {
 // 调度分两种模式：定义中所有步骤都未声明前置（DependsOn 为空）时按 Steps
 // 声明顺序逐个执行；任一步骤声明前置后进入依赖图模式——步骤在其全部前置
 // 确认成功后才启动，无前置的步骤同时启动、并发执行，某一步确认后立即调度
-// 因此就绪的后续步骤。任一正向动作预算耗尽仍失败时，停止调度未启动步骤，
+// 因此就绪的后续步骤。依赖图模式可用 Definition.MaxConcurrency 限制正向
+// 并发额度（零值不限；顺序模式始终一次一步，不受该配置影响）。任一正向动作预算耗尽仍失败时，停止调度未启动步骤，
 // 已启动的兄弟动作继续运行到返回并各自原子提交结果，随后仅按确认成功顺序
 // 的逆序补偿已确认成功的步骤；未执行到或未确认的步骤不补偿。
 //
@@ -312,6 +317,13 @@ func hasDeps(def Definition) bool {
 // graphForward 依赖图模式的正向调度：前置全部确认成功的步骤可启动，无前置
 // 的步骤同时启动；某一步确认后立即检查并启动因此就绪的后续步骤。
 //
+// Definition.MaxConcurrency 为正数时限制正向并发额度：同时处于已启动但尚未
+// 确认提交状态的步骤不超过该数量（动作调用与 ActionRetry 的等待时间同样占额）。
+// 额度有空位时按 Steps 声明顺序选择最早出现的就绪步骤启动；额度占满后其余
+// 就绪步骤保持 pending，任一步骤确认提交释放额度后立即按同一顺序继续选择，
+// 因此同一定义、同一初始状态在相同动作完成顺序下有确定的启动顺序。
+// 零值表示不限：所有就绪步骤同时启动。
+//
 // 任一步骤预算耗尽仍失败（或 ctx 取消、提交出错）时停止调度未启动步骤，
 // 但已启动的兄弟动作会继续运行到返回并各自原子提交结果，随后本函数才返回。
 // 返回 false 表示没有任何步骤需要启动（全部已确认）。
@@ -348,10 +360,19 @@ func (e *Engine) graphForward(ctx context.Context, def Definition, req Execution
 	launchedAny := false
 	halted := false // 失败/取消/出错后停止调度新步骤
 	var firstErr error
+	// limit 是正向并发额度：0 表示不限（所有就绪步骤同时启动）；正数表示
+	// 已启动但未确认提交的步骤数上限。额度自启动起占用，覆盖动作调用与
+	// ActionRetry 的等待时间，直到该步结果原子提交后才释放。
+	limit := def.MaxConcurrency
 
 	for {
 		if !halted {
+			// 按声明顺序扫描：额度有空位时总是选择最早出现的就绪步骤，
+			// 额度占满后其余就绪步骤保持 pending，待确认释放额度后继续。
 			for i := range def.Steps {
+				if limit > 0 && inFlight >= limit {
+					break
+				}
 				if launched[i] {
 					continue
 				}
