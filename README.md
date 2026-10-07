@@ -43,8 +43,9 @@
   完整事件链，按追加顺序分页；待投递、领取中、发送失败退回以及**已 Ack**
   的事件都可审计，投递次数与最近领取时间随记录一并暴露。
 
-本包不规定磁盘文件格式：持久化由 `Store` 接口承载，仓库提供进程内
-`MemoryStore`，调用方可另行实现基于数据库事务的存储。
+本包不规定磁盘文件格式：持久化由 `Store` 接口承载。仓库提供进程内
+`MemoryStore`，以及子包 `filestore` 的本地目录持久化实现 `FileStore`
+（见下文「本地文件持久化」）；调用方也可另行实现基于数据库事务的存储。
 
 ## 公开入口
 
@@ -60,6 +61,7 @@
 | `ClaimLeaseStore` | 可选的带租约领取接口：租约期内事件不被重领，失联事件到期自动恢复 |
 | `ClaimedEvent` | 带租约领取结果：`Event`、`ClaimID`、`ClaimedUntil` |
 | `MemoryStore` | 内存状态存储实现，同时实现 `Store`、`ClaimLeaseStore` 与 `EventHistoryStore` |
+| `filestore.FileStore` | 子包 `filestore` 的本地目录持久化实现，同样实现上述三个接口；`filestore.Open(dir)` 打开，`Close` 释放 |
 | `Engine` | 编排引擎，`Execute` 发起/继续执行，`GetResult` 查询结果，`ListEvents` 查询事件历史 |
 | `EventHistoryQuery` / `EventRecord` / `EventHistoryPage` | 历史查询输入（Saga 名称、业务键、幂等键、`AfterID`、`Limit`）、单条事件记录与分页结果 |
 | `Publisher` / `Relay` | 调用方实现发送，`Relay` 负责领取、发送与成败回写 |
@@ -95,6 +97,35 @@ page, err := engine.ListEvents(ctx, txsaga.EventHistoryQuery{
 // page.Events []txsaga.EventRecord：ID、Type、OccurredAt、Payload、
 // BusinessKey、Deliveries、LastAttemptAt
 ```
+
+## 本地文件持久化（filestore）
+
+子包 `filestore` 提供 `FileStore`：把执行状态与 Outbox 事件持久化到本地
+目录，只依赖 Go 标准库。`txsaga.Engine` 与 `txsaga.Relay` 可直接以它替换
+`MemoryStore`，全部可观察语义（调度、重试、补偿、幂等、领取/Ack/Nack、
+租约、投递计数、历史分页）与 `MemoryStore` 一致。
+
+```go
+store, err := filestore.Open("/var/lib/myapp/txsaga") // 必要时创建目录
+if err != nil { /* errors.Is 判定 ErrStoreOpen / ErrStoreLocked / ErrCorruptStore */ }
+defer store.Close()
+
+engine := txsaga.NewEngine(store)
+relay  := txsaga.NewRelay(store, publisher)
+```
+
+- **原子提交**：一次 `Execute` 的状态变更与当次事件整体写入单个 JSON
+  快照（临时文件 + 原子重命名）；写入被中断时旧快照保持完整，不会只留
+  下状态或只留下事件。写入返回成功后重新打开目录即可继续执行、查询
+  终态、读取历史。
+- **崩溃恢复**：普通领取的锁定随进程存亡，重开后未 Ack 的事件恢复可
+  领取；带租约事件的租约按墙钟时间持久化，到期（含重开之后）自动恢复。
+- **并发范围**：单进程内多个 goroutine 可共享同一 `FileStore`；同一进程
+  重复打开同一目录返回 `ErrStoreLocked`。不保证多进程同时写同一目录。
+- **哨兵错误**（均可 `errors.Is` 判定）：`ErrStoreOpen`（目录不可创建/
+  读写）、`ErrStoreLocked`（目录已被占用）、`ErrCorruptStore`（数据损坏/
+  截断/不一致，不覆盖原文件）、`ErrUnsupportedPayload`（负载无法用 JSON
+  稳定表示，不留下半次提交）。
 
 ## 最小用法
 

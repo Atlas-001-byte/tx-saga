@@ -256,6 +256,22 @@ func (e *Event) Deliveries() int { return e.deliveries }
 // LastAttemptAt 返回最近一次领取时间；从未被领取为零值。
 func (e *Event) LastAttemptAt() time.Time { return e.lastAttemptAt }
 
+// NewEvent 以完整字段构造一条 Outbox 事件，含投递元数据。
+// 引擎与 MemoryStore 在提交时自行分配事件；本构造函数供外部持久化
+// Store 实现（如 filestore）把磁盘中保存的事件与投递元数据还原为
+// 领取结果，不改变事件的业务语义。
+func NewEvent(id, businessKey, eventType string, occurredAt time.Time, payload any, deliveries int, lastAttemptAt time.Time) *Event {
+	return &Event{
+		ID:            id,
+		BusinessKey:   businessKey,
+		Type:          eventType,
+		OccurredAt:    occurredAt,
+		Payload:       payload,
+		deliveries:    deliveries,
+		lastAttemptAt: lastAttemptAt,
+	}
+}
+
 // EventPayload 是事件的结构化负载。
 type EventPayload struct {
 	SagaName       string `json:"saga_name"`
