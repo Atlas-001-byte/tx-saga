@@ -95,6 +95,8 @@ type CompensationFunc func(ctx context.Context, exec ExecutionView) error
 // 每次动作返回非 nil 错误且仍有剩余次数时，引擎等待 RetryWait 后再次调用
 // 同一动作；等待与动作本身都响应传入的 context。MaxAttempts 是包含首次
 // 调用在内的最大总调用次数；负数次数或负等待时长属于非法定义。
+// 动作返回被 Permanent 标记的永久错误时立即结束重试阶段：即使预算尚有
+// 剩余也不再等待、不再调用，按预算耗尽失败的同一口径提交结果与事件。
 type RetryPolicy struct {
 	// MaxAttempts 最大总调用次数（含首次）。零值按 1 处理；负数为非法定义。
 	MaxAttempts int
