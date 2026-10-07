@@ -77,6 +77,17 @@ type fsEvent struct {
 	// alive 为 false 表示事件已被 Ack：不再参与领取，但审计链继续保留。
 	// 这与内存实现“从活动 map 删除、历史链保留指针”等价。
 	alive bool
+
+	// dead 表示事件已达投递上限进入死信：退出普通领取并移出待领取队列，
+	// 等待 RequeueDeadLetterEvent 重新入队。
+	dead bool
+	// lastError 是最近一次投递失败原因；deadLetteredAt 是最近一次进入
+	// 死信的时间。重新入队后二者作为历史信息保留，不回退。
+	lastError      string
+	deadLetteredAt time.Time
+	// roundBase 是最近一次重新入队时的累计 Deliveries：本轮投递次数为
+	// deliveries-roundBase。重新入队开启新一轮有限计数，累计值不回退。
+	roundBase int
 }
 
 // fsData 是整库内存态的不可变替换根：每次变更都在其深拷贝上进行，
@@ -117,11 +128,13 @@ type FileStore struct {
 	now func() time.Time
 }
 
-// 编译期断言：FileStore 满足全部三个 Store 契约。
+// 编译期断言：FileStore 满足全部 Store 契约与死信扩展接口。
 var (
-	_ txsaga.Store             = (*FileStore)(nil)
-	_ txsaga.ClaimLeaseStore   = (*FileStore)(nil)
-	_ txsaga.EventHistoryStore = (*FileStore)(nil)
+	_ txsaga.Store                = (*FileStore)(nil)
+	_ txsaga.ClaimLeaseStore      = (*FileStore)(nil)
+	_ txsaga.EventHistoryStore    = (*FileStore)(nil)
+	_ txsaga.DeadLetterStore      = (*FileStore)(nil)
+	_ txsaga.DeadLetterLeaseStore = (*FileStore)(nil)
 )
 
 // openRegistry 记录本进程内被存活 FileStore 占用的目录（规范路径 -> 实例）。
@@ -323,6 +336,13 @@ type persistEvent struct {
 	ClaimID       string    `json:"claim_id,omitempty"`
 	ClaimedUntil  time.Time `json:"claimed_until,omitempty"`
 	Acked         bool      `json:"acked"`
+
+	// 死信与有限投递元数据。RoundBase 是最近一次重新入队时的累计
+	// Deliveries，本轮投递次数 = Deliveries-RoundBase。
+	Dead           bool      `json:"dead,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	DeadLetteredAt time.Time `json:"dead_lettered_at,omitempty"`
+	RoundBase      int       `json:"round_base,omitempty"`
 }
 
 type persistSnapshot struct {
@@ -398,13 +418,18 @@ func encodeSnapshot(d *fsData) ([]byte, error) {
 			ClaimID:        me.claimID,
 			ClaimedUntil:   me.claimedUntil,
 			Acked:          !me.alive,
+			Dead:           me.dead,
+			LastError:      me.lastError,
+			DeadLetteredAt: me.deadLetteredAt,
+			RoundBase:      me.roundBase,
 		})
 	}
-	// 落盘时压缩墓碑：已 Ack 的事件保留在审计链，但不在待领取队列中。
+	// 落盘时压缩墓碑：已 Ack 的事件保留在审计链，但不在待领取队列中；
+	// 死信事件同样退出待领取队列，等待重新入队。
 	seenPending := make(map[string]struct{}, len(d.pending))
 	for _, id := range d.pending {
 		me := d.events[id]
-		if me == nil || !me.alive {
+		if me == nil || !me.alive || me.dead {
 			continue
 		}
 		if _, dup := seenPending[id]; dup {

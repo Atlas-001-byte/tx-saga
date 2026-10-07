@@ -20,6 +20,19 @@ var (
 // defaultEventHistoryLimit 是单页上限非正数时采用的默认页大小。
 const defaultEventHistoryLimit = 100
 
+// 事件投递状态，EventRecord.Status 的取值。
+const (
+	// EventStatusPending 事件待投递（尚未领取，或发送失败已退回）。
+	EventStatusPending = "pending"
+	// EventStatusClaimed 事件领取中（普通领取锁定或有效租约内）。
+	EventStatusClaimed = "claimed"
+	// EventStatusDelivered 事件已投递成功（Ack），审计副本保留。
+	EventStatusDelivered = "delivered"
+	// EventStatusDeadLettered 事件已达投递上限进入死信，退出普通领取，
+	// 等待 RequeueDeadLetterEvent 重新入队。
+	EventStatusDeadLettered = "dead_lettered"
+)
+
 // EventHistoryQuery 是一次只读执行事件历史查询的输入。
 //
 // 执行身份由 Saga 名称、业务键与外部幂等键共同确定，与 Execute/GetResult
@@ -57,10 +70,19 @@ type EventRecord struct {
 	// BusinessKey 业务键。
 	BusinessKey string
 	// Deliveries 截至查询时该事件已进入领取/投递流程的次数（含首次）。
-	// 发送失败退回后再次领取会增大；Ack 后保留最后一次计数。
+	// 发送失败退回后再次领取会增大；Ack 后保留最后一次计数；死信重新入队
+	// 不回退该累计值。
 	Deliveries int
 	// LastAttemptAt 最近一次领取时间；从未被领取为零值。
 	LastAttemptAt time.Time
+	// Status 查询当下的投递状态，取值为 EventStatus* 常量。
+	Status string
+	// LastError 最近一次投递失败原因；从未失败为空。死信事件保留进入
+	// 死信时的失败原因；重新入队后作为历史信息保留，不回退。
+	LastError string
+	// DeadLetteredAt 最近一次进入死信的时间；从未死信为零值。
+	// 重新入队后作为历史信息保留，再次死信时更新。
+	DeadLetteredAt time.Time
 }
 
 // EventHistoryPage 是一页按追加顺序排列的执行事件。

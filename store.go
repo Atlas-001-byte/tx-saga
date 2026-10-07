@@ -202,6 +202,21 @@ type memEvent struct {
 	// 该领取失效，事件可被重新领取并获得新的 claimID。
 	claimID      string
 	claimedUntil time.Time
+
+	// acked 表示事件已确认投递（Ack）：活动副本从 events 移除，审计副本
+	// 凭本标记区分“已投递”与“待投递”。
+	acked bool
+
+	// dead 表示事件已达投递上限进入死信：退出普通领取并移出待领取队列，
+	// 保留在 events 中等待 RequeueDeadLetterEvent 重新入队。
+	dead bool
+	// lastError 是最近一次投递失败原因；deadLetteredAt 是最近一次进入
+	// 死信的时间。重新入队后二者作为历史信息保留，不回退。
+	lastError      string
+	deadLetteredAt time.Time
+	// roundBase 是最近一次重新入队时的累计 Deliveries：本轮投递次数为
+	// deliveries-roundBase。重新入队开启新一轮有限计数，累计值不回退。
+	roundBase int
 }
 
 type memTx struct {
@@ -256,11 +271,14 @@ type MemoryStore struct {
 	now      func() time.Time
 }
 
-// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore 与 EventHistoryStore。
+// 编译期断言：MemoryStore 同时满足 Store、ClaimLeaseStore、EventHistoryStore
+// 与死信扩展接口。
 var (
-	_ Store             = (*MemoryStore)(nil)
-	_ ClaimLeaseStore   = (*MemoryStore)(nil)
-	_ EventHistoryStore = (*MemoryStore)(nil)
+	_ Store                = (*MemoryStore)(nil)
+	_ ClaimLeaseStore      = (*MemoryStore)(nil)
+	_ EventHistoryStore    = (*MemoryStore)(nil)
+	_ DeadLetterStore      = (*MemoryStore)(nil)
+	_ DeadLetterLeaseStore = (*MemoryStore)(nil)
 )
 
 // NewMemoryStore 创建内存状态存储。
@@ -368,8 +386,8 @@ func (s *MemoryStore) ClaimPendingEvents(_ context.Context, max int) ([]*Event, 
 	remaining := s.pending[:0]
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
-			continue // 已 Ack 移除，丢弃墓碑 ID
+		if me == nil || me.dead {
+			continue // 已 Ack 移除或已死信隔离，丢弃墓碑 ID
 		}
 		// 已被带租约领取且租约仍有效的事件不得被无租约领取再次取得。
 		if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -409,8 +427,8 @@ func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Durat
 	live := s.pending[:0]
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
-			continue // 已 Ack 移除，丢弃墓碑 ID
+		if me == nil || me.dead {
+			continue // 已 Ack 移除或已死信隔离，丢弃墓碑 ID
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {
 			live = append(live, id) // 有效租约内：原位保留，本次跳过
@@ -442,9 +460,11 @@ func (s *MemoryStore) ClaimPendingEventsLeased(_ context.Context, ttl time.Durat
 func (s *MemoryStore) AckEvent(_ context.Context, eventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.events[eventID]; !ok {
+	me, ok := s.events[eventID]
+	if !ok {
 		return fmt.Errorf("txsaga: event %q not found", eventID)
 	}
+	me.acked = true // 审计副本凭本标记报告“已投递”
 	delete(s.events, eventID)
 	return nil
 }
@@ -462,6 +482,7 @@ func (s *MemoryStore) AckLeasedEvent(_ context.Context, eventID, claimID string)
 		// 均不得改动当前事件或新租约。
 		return fmt.Errorf("txsaga: event %q claim %q is not current: %w", eventID, claimID, ErrStaleClaim)
 	}
+	me.acked = true
 	delete(s.events, eventID)
 	return nil
 }
@@ -510,7 +531,7 @@ func (s *MemoryStore) PendingCount() int {
 	n := 0
 	for _, id := range s.pending {
 		me := s.events[id]
-		if me == nil {
+		if me == nil || me.dead {
 			continue
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -521,7 +542,8 @@ func (s *MemoryStore) PendingCount() int {
 	return n
 }
 
-// TotalEvents 返回存储中全部事件数（含领取中、待投递）。
+// TotalEvents 返回存储中全部事件数（含领取中、待投递与死信；已 Ack 事件
+// 只保留历史审计副本，不计入）。
 func (s *MemoryStore) TotalEvents() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -571,13 +593,14 @@ func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventH
 		// 不会因空游标而误回到链首。
 		page.NextAfterID = q.AfterID
 	}
+	now := s.now()
 	next := start // 本页之后第一个待检查的审计链位置
 	for i := start; i < len(s.history) && len(page.Events) < limit; i++ {
 		me := s.history[i]
 		if me.event.BusinessKey != q.BusinessKey || me.idempotencyKey != q.IdempotencyKey {
 			continue
 		}
-		page.Events = append(page.Events, toEventRecord(me))
+		page.Events = append(page.Events, toEventRecord(me, now))
 		next = i + 1
 	}
 	if len(page.Events) > 0 {
@@ -595,15 +618,32 @@ func (s *MemoryStore) ListEvents(_ context.Context, q EventHistoryQuery) (EventH
 
 // toEventRecord 把内部事件复制为脱离存储的只读记录；与活动 Outbox 事件
 // 共享同一追加时刻的身份字段，投递元数据取读取当下的最新值。
-func toEventRecord(me *memEvent) EventRecord {
+func toEventRecord(me *memEvent, now time.Time) EventRecord {
 	return EventRecord{
-		ID:            me.event.ID,
-		Type:          me.event.Type,
-		OccurredAt:    me.event.OccurredAt,
-		Payload:       cloneEventPayload(me.event.Payload),
-		BusinessKey:   me.event.BusinessKey,
-		Deliveries:    me.event.deliveries,
-		LastAttemptAt: me.event.lastAttemptAt,
+		ID:             me.event.ID,
+		Type:           me.event.Type,
+		OccurredAt:     me.event.OccurredAt,
+		Payload:        cloneEventPayload(me.event.Payload),
+		BusinessKey:    me.event.BusinessKey,
+		Deliveries:     me.event.deliveries,
+		LastAttemptAt:  me.event.lastAttemptAt,
+		Status:         eventStatusOf(me, now),
+		LastError:      me.lastError,
+		DeadLetteredAt: me.deadLetteredAt,
+	}
+}
+
+// eventStatusOf 由内部领取/确认/死信标记推导 EventRecord.Status。
+func eventStatusOf(me *memEvent, now time.Time) string {
+	switch {
+	case me.dead:
+		return EventStatusDeadLettered
+	case me.acked:
+		return EventStatusDelivered
+	case me.claimed || (me.claimID != "" && now.Before(me.claimedUntil)):
+		return EventStatusClaimed
+	default:
+		return EventStatusPending
 	}
 }
 

@@ -202,8 +202,8 @@ func (s *FileStore) ClaimPendingEvents(ctx context.Context, max int) ([]*txsaga.
 		remaining := d.pending[:0]
 		for _, eid := range d.pending {
 			me := d.events[eid]
-			if me == nil || !me.alive {
-				continue // 已 Ack，丢弃墓碑 ID
+			if me == nil || !me.alive || me.dead {
+				continue // 已 Ack 或已死信隔离，丢弃墓碑 ID
 			}
 			if me.claimID != "" && now.Before(me.claimedUntil) {
 				remaining = append(remaining, eid)
@@ -242,7 +242,7 @@ func (s *FileStore) ClaimPendingEventsLeased(ctx context.Context, ttl time.Durat
 		live := d.pending[:0]
 		for _, eid := range d.pending {
 			me := d.events[eid]
-			if me == nil || !me.alive {
+			if me == nil || !me.alive || me.dead {
 				continue
 			}
 			if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -350,7 +350,7 @@ func (s *FileStore) PendingCount() int {
 	n := 0
 	for _, eid := range s.d.pending {
 		me := s.d.events[eid]
-		if me == nil || !me.alive {
+		if me == nil || !me.alive || me.dead {
 			continue
 		}
 		if me.claimID != "" && now.Before(me.claimedUntil) {
@@ -361,7 +361,7 @@ func (s *FileStore) PendingCount() int {
 	return n
 }
 
-// TotalEvents 返回尚未 Ack 的活动事件数（含领取中、待投递），
+// TotalEvents 返回尚未 Ack 的活动事件数（含领取中、待投递与死信），
 // 与 MemoryStore.TotalEvents 的观测口径一致；已 Ack 事件只在历史中保留。
 func (s *FileStore) TotalEvents() int {
 	s.mu.Lock()

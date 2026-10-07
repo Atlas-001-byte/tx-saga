@@ -37,6 +37,9 @@ type Relay struct {
 	// leaseTTL > 0 时启用带租约领取：worker 在 Publish/Ack/Nack 前退出，
 	// 事件在租约到期后的下一轮自动恢复；0 表示沿用普通领取的默认行为。
 	leaseTTL time.Duration
+	// maxDeliveries > 0 时启用有限投递：单轮投递次数达到上限仍失败的
+	// 事件转为死信，退出普通领取；0 表示不限制次数（默认行为）。
+	maxDeliveries int
 	// now 等时间依赖直接使用 time 包标准行为。
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -86,6 +89,29 @@ func WithClaimLease(ttl time.Duration) RelayOption {
 	}
 }
 
+// WithMaxDeliveries 设置单轮投递次数上限，启用有限投递与死信。
+//
+// 仅正数生效；不配置或传入非正数时保持默认的无限重投：任何 Store 的
+// 领取、租约领取、Ack、Nack 与至少一次重投语义都不变。配置后：
+//
+//   - 每次领取使事件的累计 Deliveries 加一；Publisher 返回 nil 仍 Ack；
+//   - Publisher 返回错误时，本轮投递次数未达上限则 Nack 保留，达到上限
+//     则在同一存储操作中原子转为死信并退出普通领取；
+//   - 租约到期恢复沿用同一上限：已用尽的事件不再调用 Publisher，而是在
+//     领取操作中直接隔离为死信；
+//   - 死信事件可通过 Engine.RequeueDeadLetterEvent 重新入队，开启新一轮
+//     有限计数（累计 Deliveries 与历史失败信息不回退）。
+//
+// Store 必须实现 DeadLetterStore（启用租约时还需 DeadLetterLeaseStore），
+// 否则 DeliverOnce 与 Run 返回 ErrDeadLetterUnsupported（可 errors.Is）。
+func WithMaxDeliveries(n int) RelayOption {
+	return func(r *Relay) {
+		if n > 0 {
+			r.maxDeliveries = n
+		}
+	}
+}
+
 // NewRelay 创建事件投递器。
 func NewRelay(store Store, publisher Publisher, opts ...RelayOption) *Relay {
 	r := &Relay{
@@ -119,16 +145,37 @@ type RelayResult struct {
 	Claimed int
 	// Delivered 发送成功并 Ack 的事件数。
 	Delivered int
-	// Failed 发送失败并 Nack 保留的事件数。
+	// Failed 发送失败并 Nack 保留的事件数（含 Publish 前 ctx 取消被退回的）。
 	Failed int
+	// DeadLettered 本轮转为死信的事件数（发送失败达到投递上限，或领取时
+	// 发现本轮次数已用尽被直接隔离）。仅在配置 WithMaxDeliveries 后非零。
+	DeadLettered int
 }
 
 // DeliverOnce 执行一轮领取与投递，不阻塞等待。没有事件时立即返回空结果。
 // 单个事件发送失败不影响同批其它事件；失败事件被 Nack，可在后续轮次继续领取。
+// 配置 WithMaxDeliveries 后，达到投递上限的失败事件在同一存储操作中转死信
+// 并计入 RelayResult.DeadLettered，不再参与后续领取。
 //
 // 通过 WithClaimLease 启用租约且 Store 未实现 ClaimLeaseStore 时，
 // 返回包装了 ErrClaimLeaseUnsupported 的错误（可 errors.Is 判定）。
+// 通过 WithMaxDeliveries 启用有限投递且 Store 未实现 DeadLetterStore
+// （启用租约时为 DeadLetterLeaseStore）时，返回 ErrDeadLetterUnsupported。
 func (r *Relay) DeliverOnce(ctx context.Context) (RelayResult, error) {
+	if r.maxDeliveries > 0 {
+		if r.leaseTTL > 0 {
+			store, ok := r.store.(DeadLetterLeaseStore)
+			if !ok {
+				return RelayResult{}, ErrDeadLetterUnsupported
+			}
+			return r.deliverOnceLeasedBounded(ctx, store)
+		}
+		store, ok := r.store.(DeadLetterStore)
+		if !ok {
+			return RelayResult{}, ErrDeadLetterUnsupported
+		}
+		return r.deliverOnceBounded(ctx, store)
+	}
 	if r.leaseTTL > 0 {
 		leased, ok := r.store.(ClaimLeaseStore)
 		if !ok {
@@ -202,6 +249,84 @@ func (r *Relay) deliverOnceLeased(ctx context.Context, store ClaimLeaseStore) (R
 				return res, nackErr
 			}
 			res.Failed++
+			continue
+		}
+		if ackErr := store.AckLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); ackErr != nil &&
+			!errors.Is(ackErr, ErrStaleClaim) {
+			return res, ackErr
+		}
+		res.Delivered++
+	}
+	return res, nil
+}
+
+// deliverOnceBounded 是配置 WithMaxDeliveries 后的默认（无租约）投递路径：
+// 领取时本轮次数已用尽的事件由 Store 直接隔离为死信；发送失败达到上限的
+// 事件在 Nack 的同一存储操作中转死信，未达上限的退回保留。
+func (r *Relay) deliverOnceBounded(ctx context.Context, store DeadLetterStore) (RelayResult, error) {
+	events, dead, err := store.ClaimPendingEventsBounded(ctx, r.maxDeliveries, r.batch)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	res := RelayResult{Claimed: len(events), DeadLettered: dead}
+	for _, ev := range events {
+		if err := ctx.Err(); err != nil {
+			// 退出前把尚未处理的已领取事件退回；取消不算投递失败，
+			// 不消耗投递上限，也不计成功。
+			_ = r.store.NackEvent(ctx, ev.ID)
+			res.Failed++
+			continue
+		}
+		if pubErr := r.publisher.Publish(ctx, *ev); pubErr != nil {
+			dl, nackErr := store.NackEventBounded(ctx, ev.ID, pubErr.Error(), r.maxDeliveries)
+			if nackErr != nil {
+				return res, nackErr
+			}
+			if dl {
+				res.DeadLettered++
+			} else {
+				res.Failed++
+			}
+			continue
+		}
+		if err := r.store.AckEvent(ctx, ev.ID); err != nil {
+			return res, err
+		}
+		res.Delivered++
+	}
+	return res, nil
+}
+
+// deliverOnceLeasedBounded 是同时启用租约与有限投递后的投递路径。
+// 取消语义与 deliverOnceLeased 相同：Publish 前取消按当前 ClaimID 立即
+// Nack（不消耗投递上限）；Publish 进行中取消按 Publish 的返回结果处理；
+// worker 未 Nack 就退出时，租约到期后由下一轮按上限恢复或隔离。
+func (r *Relay) deliverOnceLeasedBounded(ctx context.Context, store DeadLetterLeaseStore) (RelayResult, error) {
+	claims, dead, err := store.ClaimPendingEventsLeasedBounded(ctx, r.leaseTTL, r.maxDeliveries, r.batch)
+	if err != nil {
+		return RelayResult{}, err
+	}
+	res := RelayResult{Claimed: len(claims), DeadLettered: dead}
+	for _, c := range claims {
+		if err := ctx.Err(); err != nil {
+			if nackErr := store.NackLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); nackErr != nil &&
+				!errors.Is(nackErr, ErrStaleClaim) {
+				return res, nackErr
+			}
+			res.Failed++
+			continue
+		}
+		pubErr := r.publisher.Publish(ctx, *c.Event)
+		if pubErr != nil {
+			dl, nackErr := store.NackLeasedEventBounded(context.Background(), c.Event.ID, c.ClaimID, pubErr.Error(), r.maxDeliveries)
+			if nackErr != nil && !errors.Is(nackErr, ErrStaleClaim) {
+				return res, nackErr
+			}
+			if dl {
+				res.DeadLettered++
+			} else {
+				res.Failed++
+			}
 			continue
 		}
 		if ackErr := store.AckLeasedEvent(context.Background(), c.Event.ID, c.ClaimID); ackErr != nil &&

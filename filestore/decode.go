@@ -117,6 +117,20 @@ func decodeSnapshot(raw []byte) (*fsData, error) {
 			// 普通领取与租约领取互斥（内存实现接管到期租约会清除 ClaimID）。
 			return nil, fmt.Errorf("event %q held by both claim kinds: %w", pe.ID, ErrCorruptStore)
 		}
+		if pe.RoundBase < 0 || pe.RoundBase > pe.Deliveries {
+			return nil, fmt.Errorf("event %q round base %d out of range [0,%d]: %w",
+				pe.ID, pe.RoundBase, pe.Deliveries, ErrCorruptStore)
+		}
+		if pe.Dead {
+			// 死信事件已退出普通领取：不得持有任何领取标记，且必须记录
+			// 进入死信时间；死信与已 Ack 互斥。
+			if pe.Acked || pe.Claimed || pe.ClaimID != "" {
+				return nil, fmt.Errorf("event %q dead-lettered while acked or claimed: %w", pe.ID, ErrCorruptStore)
+			}
+			if pe.DeadLetteredAt.IsZero() {
+				return nil, fmt.Errorf("event %q dead-lettered without dead-letter time: %w", pe.ID, ErrCorruptStore)
+			}
+		}
 		ev := txsaga.Event{
 			ID:          pe.ID,
 			BusinessKey: pe.BusinessKey,
@@ -132,6 +146,10 @@ func decodeSnapshot(raw []byte) (*fsData, error) {
 			claimID:        pe.ClaimID,
 			claimedUntil:   pe.ClaimedUntil,
 			alive:          !pe.Acked,
+			dead:           pe.Dead,
+			lastError:      pe.LastError,
+			deadLetteredAt: pe.DeadLetteredAt,
+			roundBase:      pe.RoundBase,
 		}
 		knownIDs[pe.ID] = me
 		d.history = append(d.history, me)
@@ -141,7 +159,7 @@ func decodeSnapshot(raw []byte) (*fsData, error) {
 			ps.Seq, lastSeqNum, ErrCorruptStore)
 	}
 
-	// 待领取队列：引用必须存在、未 Ack、不重复。
+	// 待领取队列：引用必须存在、未 Ack、未死信、不重复。
 	seen := make(map[string]struct{}, len(ps.Pending))
 	for _, id := range ps.Pending {
 		me, ok := knownIDs[id]
@@ -150,6 +168,9 @@ func decodeSnapshot(raw []byte) (*fsData, error) {
 		}
 		if !me.alive {
 			return nil, fmt.Errorf("acked event %q still pending: %w", id, ErrCorruptStore)
+		}
+		if me.dead {
+			return nil, fmt.Errorf("dead-lettered event %q still pending: %w", id, ErrCorruptStore)
 		}
 		if _, dup := seen[id]; dup {
 			return nil, fmt.Errorf("pending event %q duplicated: %w", id, ErrCorruptStore)
